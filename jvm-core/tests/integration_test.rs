@@ -379,6 +379,25 @@ fn interface_default_method_dispatch() {
     assert_eq!(result, "I am Thing");
 }
 
+#[test]
+fn interface_monomorphic_cache_updates_when_receiver_changes() {
+    let result = run_jar_test(
+        "InterfaceMonomorphicDispatchTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "A|B|A");
+}
+
+#[test]
+fn virtual_monomorphic_cache_updates_when_receiver_changes() {
+    let result = run_jar_test(
+        "VirtualMonomorphicDispatchTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "A|B|A");
+}
 // ---------------------------------------------------------------------------
 // Green threads: Thread.start() / Thread.join()
 // ---------------------------------------------------------------------------

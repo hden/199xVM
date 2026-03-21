@@ -176,6 +176,13 @@ struct InstanceFieldLayout {
 }
 
 #[derive(Clone)]
+pub(super) struct ResolvedVirtualCallSite {
+    pub dispatch_class: String,
+    pub method_name: String,
+    pub method_info: Rc<MethodExecInfo>,
+}
+
+#[derive(Clone)]
 pub(super) struct ReflectFieldInfo {
     pub name: String,
     pub descriptor: String,
@@ -877,6 +884,12 @@ pub struct Vm {
     /// Cached decoded class refs keyed by `(cp pointer, cp index)`.
     classref_constant_cache: HashMap<(usize, u16), Rc<str>>,
     /// Static field owner cache: symbolic owner/name/descriptor → declaring class id.
+    /// Cached resolved static call sites keyed by `(cp pointer, cp index)`.
+    static_callsite_cache: HashMap<(usize, u16), Rc<ResolvedStaticCallSite>>,
+    /// Monomorphic virtual/interface call-site cache keyed by `(cp pointer, cp index)`.
+    /// Each entry remembers the most recently seen dispatch class for that call site.
+    virtual_callsite_cache: HashMap<(usize, u16), Rc<ResolvedVirtualCallSite>>,
+    /// Static field owner cache: symbolic owner/name/descriptor → declaring class id.
     /// Mirrors HotSpot's resolved field entries well enough for repeated getstatic/putstatic.
     static_field_owner_cache: HashMap<(ClassId, String, String), Option<ClassId>>,
     /// Cached decoded field refs keyed by `(cp pointer, cp index)`.
@@ -939,6 +952,8 @@ impl Vm {
             method_signature_cache: HashMap::default(),
             methodref_constant_cache: HashMap::default(),
             classref_constant_cache: HashMap::default(),
+            static_callsite_cache: HashMap::default(),
+            virtual_callsite_cache: HashMap::default(),
             static_field_owner_cache: HashMap::default(),
             fieldref_constant_cache: HashMap::default(),
             method_exec_info_cache: HashMap::default(),
@@ -1222,6 +1237,8 @@ impl Vm {
         self.method_signature_cache.clear();
         self.methodref_constant_cache.clear();
         self.classref_constant_cache.clear();
+        self.static_callsite_cache.clear();
+        self.virtual_callsite_cache.clear();
         self.static_field_owner_cache.clear();
         self.fieldref_constant_cache.clear();
         self.method_exec_info_cache.clear();

@@ -795,7 +795,6 @@ impl Vm {
             push_return,
         )))
     }
-
     pub(crate) fn build_virtual_frame_from_info(
         &mut self,
         this: JRef,
