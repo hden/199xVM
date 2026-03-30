@@ -17,7 +17,7 @@ use wasm_bindgen::prelude::*;
 use crate::class_file::{
     self, Attribute, BootstrapMethod, ClassFile, ConstantPoolEntry, ExceptionTableEntry,
 };
-use crate::heap::{JObject, JRef, JValue};
+use crate::heap::{JavaStringValue, JObject, JRef, JValue};
 
 type OwnedJarArchive = zip::ZipArchive<std::io::Cursor<Vec<u8>>>;
 
@@ -148,6 +148,7 @@ mod tests {
         }
         assert!(vm.resolve_class("missing/Type").is_none(), "missing class must remain unresolved");
     }
+
 }
 
 /// A class entry in the VM's class registry.
@@ -438,8 +439,8 @@ pub struct Vm {
     /// Entries start as `LazyClass::PendingBytes`/`PendingJarEntry` and are promoted to
     /// `LazyClass::Ready` (parsed `ClassFile`) on first access.
     pub(in crate::interpreter) classes: HashMap<String, LazyClass>,
-    /// Interned strings cache (not strictly required but saves allocations).
-    pub(in crate::interpreter) string_pool: HashMap<String, JRef>,
+    /// Interned strings cache keyed by UTF-16 content.
+    pub(in crate::interpreter) string_pool: HashMap<JavaStringValue, JRef>,
     /// Static field storage keyed by class name → field name.
     /// Avoids allocating a `"ClassName.fieldName"` string on every getstatic/putstatic.
     pub(in crate::interpreter) static_fields: HashMap<String, HashMap<String, JValue>>,
@@ -1119,15 +1120,35 @@ impl Vm {
             .any(|t| matches!(t.state, ThreadState::WaitingOnCondition(id) if id == stdin_id))
     }
 
-    /// Intern a Java string (returns same `JRef` for equal content).
+    /// Intern a Java string (returns same `JRef` for equal UTF-16 content).
     pub fn intern_string(&mut self, s: impl Into<String>) -> JRef {
+        self.intern_string_value(JavaStringValue::new(s))
+    }
+
+    pub fn intern_string_utf16(&mut self, utf16: Vec<u16>) -> JRef {
+        self.intern_string_value(JavaStringValue::from_utf16(utf16))
+    }
+
+    pub fn intern_string_value(&mut self, value: JavaStringValue) -> JRef {
         use std::collections::hash_map::Entry;
-        let s = s.into();
-        match self.string_pool.entry(s) {
+        match self.string_pool.entry(value.clone()) {
             Entry::Occupied(e) => Rc::clone(e.get()),
             Entry::Vacant(e) => {
-                let jobj = JObject::new_string(e.key().clone());
+                let jobj = JObject::new_string_value(value);
                 Rc::clone(e.insert(jobj))
+            }
+        }
+    }
+
+    pub fn intern_existing_string_ref(&mut self, string_ref: &JRef) -> Option<JRef> {
+        use std::collections::hash_map::Entry;
+
+        let value = string_ref.borrow().as_java_string_value().cloned()?;
+        match self.string_pool.entry(value) {
+            Entry::Occupied(e) => Some(Rc::clone(e.get())),
+            Entry::Vacant(e) => {
+                e.insert(Rc::clone(string_ref));
+                Some(Rc::clone(string_ref))
             }
         }
     }
@@ -1144,10 +1165,10 @@ impl Vm {
                 let b = r.borrow();
                 let mut s = format!("Exception: {}", b.class_name);
                 if let Some(JValue::Ref(Some(msg_ref))) = b.fields.get("detailMessage") {
-                    if let Some(msg) = msg_ref.borrow().as_java_string() {
+                    if let Some(msg) = msg_ref.borrow().java_string_to_string_lossy() {
                         if !msg.is_empty() {
                             s.push_str(": ");
-                            s.push_str(msg);
+                            s.push_str(&msg);
                         }
                     }
                 }

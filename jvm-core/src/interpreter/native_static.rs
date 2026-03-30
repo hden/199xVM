@@ -1,5 +1,6 @@
+use std::borrow::Cow;
 use std::rc::Rc;
-use crate::heap::{JObject, JValue, NativePayload};
+use crate::heap::{JavaStringValue, JObject, JValue, NativePayload};
 
 /// Returns true if `regex` ends with an unescaped `$` anchor.
 /// A `$` is escaped when preceded by an odd number of backslashes.
@@ -42,6 +43,49 @@ pub(super) fn regex_full_match(regex: &str, input: &str) -> bool {
         })
 }
 
+/// Encode a Java UTF-16 string into a Rust `String` suitable for the regex crate.
+///
+/// Valid surrogate pairs are materialized as their scalar value so regex
+/// operators like `.` still see a single Unicode character. Lone surrogates are
+/// mapped into the BMP private-use area so they survive round-trips without
+/// collapsing to an empty string or U+FFFD.
+pub(super) fn regex_encode_java_string(value: &JavaStringValue) -> Cow<'_, str> {
+    if let Some(utf8) = value.as_str() {
+        return Cow::Borrowed(utf8);
+    }
+    let mut out = String::new();
+    for decoded in std::char::decode_utf16(value.utf16().iter().copied()) {
+        match decoded {
+            Ok(ch) => out.push(ch),
+            Err(err) => {
+                let encoded = 0xE000 + (u32::from(err.unpaired_surrogate()) - 0xD800);
+                out.push(char::from_u32(encoded).expect("valid encoded code point"));
+            }
+        }
+    }
+    Cow::Owned(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::regex_encode_java_string;
+    use crate::heap::JavaStringValue;
+
+    #[test]
+    fn regex_encode_java_string_keeps_supplementary_scalars() {
+        let value = JavaStringValue::from_utf16(vec![0xD83D, 0xDE00]);
+        let encoded = regex_encode_java_string(&value);
+        assert_eq!(encoded.as_ref(), "😀");
+    }
+
+    #[test]
+    fn regex_encode_java_string_maps_unpaired_surrogates_to_private_use() {
+        let value = JavaStringValue::from_utf16(vec![0xD83D]);
+        let encoded = regex_encode_java_string(&value);
+        assert_eq!(encoded.chars().collect::<Vec<_>>(), vec!['\u{E03D}']);
+    }
+}
+
 impl super::Vm {
     pub(super) fn native_static(
         &mut self,
@@ -52,25 +96,29 @@ impl super::Vm {
     ) -> Option<JValue> {
         match (_class_name, _method_name, _descriptor) {
             ("java/util/regex/Pattern", "compile", "(Ljava/lang/String;)Ljava/util/regex/Pattern;") => {
-                let regex = _args
+                let regex_ref = _args
                     .first()
                     .and_then(|v| v.as_ref())
-                    .and_then(|r| r.borrow().as_java_string().map(|s| s.to_owned()))
-                    .unwrap_or_default();
+                    .cloned()
+                    .unwrap_or_else(|| self.intern_string(""));
                 let p = JObject::new("java/util/regex/Pattern");
-                p.borrow_mut().fields.insert("__regex".to_owned(), JValue::Ref(Some(self.intern_string(regex))));
+                p.borrow_mut()
+                    .fields
+                    .insert("__regex".to_owned(), JValue::Ref(Some(regex_ref)));
                 p.borrow_mut().fields.insert("__flags".to_owned(), JValue::Int(0));
                 Some(JValue::Ref(Some(p)))
             }
             ("java/util/regex/Pattern", "compile", "(Ljava/lang/String;I)Ljava/util/regex/Pattern;") => {
-                let regex = _args
+                let regex_ref = _args
                     .first()
                     .and_then(|v| v.as_ref())
-                    .and_then(|r| r.borrow().as_java_string().map(|s| s.to_owned()))
-                    .unwrap_or_default();
+                    .cloned()
+                    .unwrap_or_else(|| self.intern_string(""));
                 let flags = _args.get(1).map(|v| v.as_int()).unwrap_or(0);
                 let p = JObject::new("java/util/regex/Pattern");
-                p.borrow_mut().fields.insert("__regex".to_owned(), JValue::Ref(Some(self.intern_string(regex))));
+                p.borrow_mut()
+                    .fields
+                    .insert("__regex".to_owned(), JValue::Ref(Some(regex_ref)));
                 p.borrow_mut().fields.insert("__flags".to_owned(), JValue::Int(flags));
                 Some(JValue::Ref(Some(p)))
             }
@@ -78,12 +126,14 @@ impl super::Vm {
                 let regex = _args
                     .first()
                     .and_then(|v| v.as_ref())
-                    .and_then(|r| r.borrow().as_java_string().map(|s| s.to_owned()))
+                    .and_then(|r| r.borrow().as_java_string_value().cloned())
+                    .map(|s| regex_encode_java_string(&s).into_owned())
                     .unwrap_or_default();
                 let input = _args
                     .get(1)
                     .and_then(|v| v.as_ref())
-                    .and_then(|r| r.borrow().as_java_string().map(|s| s.to_owned()))
+                    .and_then(|r| r.borrow().as_java_string_value().cloned())
+                    .map(|s| regex_encode_java_string(&s).into_owned())
                     .unwrap_or_default();
                 let ok = regex_full_match(&regex, &input);
                 Some(JValue::Int(if ok { 1 } else { 0 }))
@@ -92,12 +142,14 @@ impl super::Vm {
                 let regex = _args
                     .first()
                     .and_then(|v| v.as_ref())
-                    .and_then(|r| r.borrow().as_java_string().map(|s| s.to_owned()))
+                    .and_then(|r| r.borrow().as_java_string_value().cloned())
+                    .map(|s| regex_encode_java_string(&s).into_owned())
                     .unwrap_or_default();
                 let input = _args
                     .get(1)
                     .and_then(|v| v.as_ref())
-                    .and_then(|r| r.borrow().as_java_string().map(|s| s.to_owned()))
+                    .and_then(|r| r.borrow().as_java_string_value().cloned())
+                    .map(|s| regex_encode_java_string(&s).into_owned())
                     .unwrap_or_default();
                 let ok = regex_full_match(&regex, &input);
                 Some(JValue::Int(if ok { 1 } else { 0 }))

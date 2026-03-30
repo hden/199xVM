@@ -2,13 +2,20 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::class_file::{BootstrapMethod, ConstantPoolEntry};
-use crate::heap::{JObject, JRef, JValue, NativePayload};
+use crate::heap::{JavaStringValue, JObject, JRef, JValue, NativePayload};
 
 use super::Vm;
 use super::descriptors::*;
 use super::frame::*;
 use super::trampoline::FrameInfo;
 
+fn push_utf16_str(out: &mut Vec<u16>, s: &str) {
+    out.extend(s.encode_utf16());
+}
+
+fn push_java_string_value(out: &mut Vec<u16>, value: &JavaStringValue) {
+    out.extend_from_slice(value.utf16());
+}
 
 impl Vm {
     // -----------------------------------------------------------------------
@@ -462,7 +469,7 @@ impl Vm {
                 };
 
                 let arg_types = arg_type_chars(&descriptor);
-                let mut result = String::new();
+                let mut result = Vec::new();
                 let mut arg_idx = 0;
                 let mut const_idx = 0usize;
                 for ch in recipe.chars() {
@@ -471,31 +478,32 @@ impl Vm {
                         if let Some(a) = args.get(arg_idx) {
                             let is_bool = arg_types.get(arg_idx) == Some(&'Z');
                             match a {
-                                JValue::Int(v) if is_bool => result.push_str(if *v != 0 { "true" } else { "false" }),
+                                JValue::Int(v) if is_bool => push_utf16_str(&mut result, if *v != 0 { "true" } else { "false" }),
                                 JValue::Int(v) if arg_types.get(arg_idx) == Some(&'C') => {
-                                    // char argument — convert int to character
-                                    result.push(char::from_u32(*v as u32).unwrap_or('\u{FFFD}'));
+                                    result.push(*v as u16);
                                 }
-                                JValue::Int(v) => result.push_str(&v.to_string()),
-                                JValue::Long(v) => result.push_str(&v.to_string()),
-                                JValue::Float(v) => result.push_str(&v.to_string()),
-                                JValue::Double(v) => result.push_str(&v.to_string()),
+                                JValue::Int(v) => push_utf16_str(&mut result, &v.to_string()),
+                                JValue::Long(v) => push_utf16_str(&mut result, &v.to_string()),
+                                JValue::Float(v) => push_utf16_str(&mut result, &v.to_string()),
+                                JValue::Double(v) => push_utf16_str(&mut result, &v.to_string()),
                                 JValue::Ref(Some(r)) => {
-                                    if let Some(s) = r.borrow().as_java_string() {
-                                        result.push_str(s);
+                                    if let Some(s) = r.borrow().as_java_string_value().cloned() {
+                                        push_java_string_value(&mut result, &s);
                                     } else {
                                         // Call toString() on the object.
                                         match self.invoke_virtual(r.clone(), &r.borrow().class_name.clone(), "toString", "()Ljava/lang/String;", vec![]) {
                                             Ok(JValue::Ref(Some(sr))) => {
-                                                if let Some(s) = sr.borrow().as_java_string() {
-                                                    result.push_str(s);
+                                                if let Some(s) = sr.borrow().as_java_string_value().cloned() {
+                                                    push_java_string_value(&mut result, &s);
+                                                } else if let Some(s) = sr.borrow().java_string_to_string_lossy() {
+                                                    push_utf16_str(&mut result, &s);
                                                 }
                                             }
-                                            _ => result.push_str(&r.borrow().class_name),
+                                            _ => push_utf16_str(&mut result, &r.borrow().class_name),
                                         }
                                     }
                                 }
-                                JValue::Ref(None) => result.push_str("null"),
+                                JValue::Ref(None) => push_utf16_str(&mut result, "null"),
                                 _ => {}
                             }
                         }
@@ -508,42 +516,42 @@ impl Vm {
                             Some(&cp_idx) => match cp.get(cp_idx as usize) {
                                 Some(ConstantPoolEntry::String { string_index }) => {
                                     if let Some(ConstantPoolEntry::Utf8(s)) = cp.get(*string_index as usize) {
-                                        result.push_str(s);
+                                        push_utf16_str(&mut result, s);
                                     }
                                 }
-                                Some(ConstantPoolEntry::Integer(v)) => result.push_str(&v.to_string()),
-                                Some(ConstantPoolEntry::Long(v)) => result.push_str(&v.to_string()),
+                                Some(ConstantPoolEntry::Integer(v)) => push_utf16_str(&mut result, &v.to_string()),
+                                Some(ConstantPoolEntry::Long(v)) => push_utf16_str(&mut result, &v.to_string()),
                                 Some(ConstantPoolEntry::Float(v)) => {
                                     // Use Java-compatible formatting: finite values via Rust,
                                     // but infinities/NaN must match Java's Float.toString output.
                                     if v.is_infinite() {
-                                        result.push_str(if *v > 0.0 { "Infinity" } else { "-Infinity" });
+                                        push_utf16_str(&mut result, if *v > 0.0 { "Infinity" } else { "-Infinity" });
                                     } else if v.is_nan() {
-                                        result.push_str("NaN");
+                                        push_utf16_str(&mut result, "NaN");
                                     } else {
-                                        result.push_str(&v.to_string());
+                                        push_utf16_str(&mut result, &v.to_string());
                                     }
                                 }
                                 Some(ConstantPoolEntry::Double(v)) => {
                                     if v.is_infinite() {
-                                        result.push_str(if *v > 0.0 { "Infinity" } else { "-Infinity" });
+                                        push_utf16_str(&mut result, if *v > 0.0 { "Infinity" } else { "-Infinity" });
                                     } else if v.is_nan() {
-                                        result.push_str("NaN");
+                                        push_utf16_str(&mut result, "NaN");
                                     } else {
-                                        result.push_str(&v.to_string());
+                                        push_utf16_str(&mut result, &v.to_string());
                                     }
                                 }
-                                Some(ConstantPoolEntry::Utf8(s)) => result.push_str(s),
+                                Some(ConstantPoolEntry::Utf8(s)) => push_utf16_str(&mut result, s),
                                 Some(ConstantPoolEntry::Class { name_index }) => {
                                     if let Some(ConstantPoolEntry::Utf8(s)) = cp.get(*name_index as usize) {
-                                        result.push_str(s);
+                                        push_utf16_str(&mut result, s);
                                     }
                                 }
                                 Some(ConstantPoolEntry::MethodHandle { .. })
                                 | Some(ConstantPoolEntry::MethodType { .. }) => {
                                     // Stable debug representation for unsupported handle/type constants.
                                     if let Some(entry) = cp.get(cp_idx as usize) {
-                                        result.push_str(&format!("{entry:?}"));
+                                        push_utf16_str(&mut result, &format!("{entry:?}"));
                                     }
                                 }
                                 Some(other) => {
@@ -561,10 +569,12 @@ impl Vm {
                         }
                         const_idx += 1;
                     } else {
-                        result.push(ch);
+                        let mut buf = [0u16; 2];
+                        let encoded = ch.encode_utf16(&mut buf);
+                        result.extend_from_slice(encoded);
                     }
                 }
-                Ok(JValue::Ref(Some(JObject::new_string(result))))
+                Ok(JValue::Ref(Some(JObject::new_string_utf16(result))))
             }
 
             "java/lang/runtime/SwitchBootstraps" | "java/lang/invoke/SwitchBootstraps" => {

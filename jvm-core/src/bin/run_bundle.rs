@@ -43,12 +43,14 @@ fn main() {
                 jvm_core::heap::JValue::Ref(Some(r)) => {
                     let is_str = matches!(r.borrow().native, jvm_core::heap::NativePayload::JavaString(_));
                     if is_str {
-                        r.borrow().as_java_string().unwrap_or_default().to_owned()
+                        r.borrow().java_string_to_string_lossy().unwrap_or_default()
                     } else {
                         let cn = r.borrow().class_name.clone();
                         match vm.invoke_virtual(r.clone(), &cn, "toString", "()Ljava/lang/String;", vec![]) {
                             Ok(jvm_core::heap::JValue::Ref(Some(s))) => {
-                                s.borrow().as_java_string().unwrap_or_default().to_owned()
+                                s.borrow()
+                                    .java_string_to_string_lossy()
+                                    .unwrap_or_default()
                             }
                             _ => format!("{}@obj", cn),
                         }

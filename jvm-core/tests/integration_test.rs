@@ -82,7 +82,7 @@ fn jvalue_to_string(v: &jvm_core::heap::JValue) -> String {
         jvm_core::heap::JValue::Ref(Some(r)) => {
             let obj = r.borrow();
             match &obj.native {
-                jvm_core::heap::NativePayload::JavaString(s) => s.clone(),
+                jvm_core::heap::NativePayload::JavaString(s) => s.to_string_lossy(),
                 _ => format!("{}@obj", obj.class_name),
             }
         }
@@ -116,6 +116,56 @@ fn string_concat() {
         "()Ljava/lang/String;",
     );
     assert_eq!(result, "OK: 42");
+}
+
+#[test]
+fn string_emoji_length_and_char_at() {
+    let result = run_jar_test(
+        "StringEmojiLengthAndCharAtTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "2|55357|56832");
+}
+
+#[test]
+fn string_emoji_substring_half_preserves_surrogates() {
+    let result = run_jar_test(
+        "StringEmojiSubstringHalfTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "1|55357|1|56832");
+}
+
+#[test]
+fn string_surrogate_hash_and_intern() {
+    let result = run_jar_test(
+        "StringSurrogateHashAndInternTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "1772899|55357|true");
+}
+
+#[test]
+fn string_concat_surrogate_half_preserves_utf16() {
+    let result = run_jar_test(
+        "StringConcatSurrogateHalfTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "2|55357|56832|true");
+}
+
+#[test]
+fn string_cjk_substring_and_index_of_last_index_of() {
+    let result = run_jar_test(
+        "StringCjkSubstringAndIndexOfTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "\u{3042}\u{D55C}\u{4E2D}|2|4");
 }
 
 // ---------------------------------------------------------------------------
@@ -763,6 +813,86 @@ fn regex_capture_groups() {
 fn regex_find_escaped_parens() {
     let result = run_jar_test("RegexFindEscapedParensTest", "run", "()Ljava/lang/String;");
     assert_eq!(result, "true|Wrong number of args (0) passed to: :kw|false");
+}
+
+#[test]
+fn regex_find_bmp_non_ascii_offsets() {
+    let result = run_jar_test(
+        "RegexFindBmpNonAsciiOffsetsTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "true|1|2|x");
+}
+
+#[test]
+fn regex_find_cjk_offsets() {
+    let result = run_jar_test(
+        "RegexFindCjkOffsetsTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "true|2|4|\u{D55C}\u{4E2D}");
+}
+
+#[test]
+fn regex_find_repeated_cjk_matches() {
+    let result = run_jar_test(
+        "RegexFindRepeatedCjkMatchesTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "1:2,3:4");
+}
+
+#[test]
+fn regex_find_zero_length_cjk_boundaries() {
+    let result = run_jar_test(
+        "RegexFindZeroLengthCjkBoundariesTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "0:0,1:1,2:2");
+}
+
+#[test]
+fn regex_find_emoji_offsets() {
+    let result = run_jar_test(
+        "RegexFindEmojiOffsetsTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, format!("true|1|3|{}", '\u{1F600}'));
+}
+
+#[test]
+fn regex_find_empty_emoji_boundaries() {
+    let result = run_jar_test(
+        "RegexFindEmptyEmojiBoundariesTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "0:0,1:1,2:2");
+}
+
+#[test]
+fn regex_surrogate_half_paths() {
+    let result = run_jar_test(
+        "RegexSurrogateHalfPathsTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "true|true|true|0|1|1|55357|false");
+}
+
+#[test]
+fn regex_find_emoji_wildcard() {
+    let result = run_jar_test(
+        "RegexFindEmojiWildcardTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "true|0|2|2|55357|56832");
 }
 
 #[test]
