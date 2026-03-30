@@ -17,30 +17,21 @@ fn ends_with_unescaped_dollar(regex: &str) -> bool {
     trailing_backslashes % 2 == 0
 }
 
-/// Perform a full-string regex match as Java's `Matcher.matches()` requires.
+/// Build the host regex source for Java's full-string `Matcher.matches()` semantics.
 ///
 /// Always wraps the pattern with `^(?:...)$` to enforce full-string semantics.
 /// To avoid `^(?:^...$)$` (which breaks Rust's regex engine), a leading `^`
-/// and a trailing unescaped `$` are stripped before wrapping.  This correctly
+/// and a trailing unescaped `$` are stripped before wrapping. This correctly
 /// handles alternations like `^foo$|bar$` — the stripped form `foo$|bar` is
 /// re-anchored as `^(?:foo$|bar)$`, so `"xxbar"` no longer matches.
-pub(super) fn regex_full_match(regex: &str, input: &str) -> bool {
-    if regex == ".*" {
-        return true;
-    }
+pub(super) fn regex_full_match_source(regex: &str) -> String {
     let stripped_start = regex.strip_prefix('^').unwrap_or(regex);
     let stripped = if ends_with_unescaped_dollar(stripped_start) {
         &stripped_start[..stripped_start.len() - 1]
     } else {
         stripped_start
     };
-    let anchored = format!("^(?:{stripped})$");
-    regex::Regex::new(&anchored)
-        .map(|re| re.is_match(input))
-        .unwrap_or_else(|e| {
-            eprintln!("Unsupported regex pattern '{regex}': {e}");
-            false
-        })
+    format!("^(?:{stripped})$")
 }
 
 /// Encode a Java UTF-16 string into a Rust `String` suitable for the regex crate.
@@ -135,7 +126,17 @@ impl super::Vm {
                     .and_then(|r| r.borrow().as_java_string_value().cloned())
                     .map(|s| regex_encode_java_string(&s).into_owned())
                     .unwrap_or_default();
-                let ok = regex_full_match(&regex, &input);
+                let ok = if regex == ".*" {
+                    true
+                } else {
+                    let anchored = regex_full_match_source(&regex);
+                    self.compile_regex_cached(&anchored, 0)
+                        .map(|re| re.is_match(&input))
+                        .unwrap_or_else(|| {
+                            eprintln!("Unsupported regex pattern '{regex}'");
+                            false
+                        })
+                };
                 Some(JValue::Int(if ok { 1 } else { 0 }))
             }
             ("java/util/regex/Matcher", "nativeMatches", "(Ljava/lang/String;Ljava/lang/String;)Z") => {
@@ -151,7 +152,17 @@ impl super::Vm {
                     .and_then(|r| r.borrow().as_java_string_value().cloned())
                     .map(|s| regex_encode_java_string(&s).into_owned())
                     .unwrap_or_default();
-                let ok = regex_full_match(&regex, &input);
+                let ok = if regex == ".*" {
+                    true
+                } else {
+                    let anchored = regex_full_match_source(&regex);
+                    self.compile_regex_cached(&anchored, 0)
+                        .map(|re| re.is_match(&input))
+                        .unwrap_or_else(|| {
+                            eprintln!("Unsupported regex pattern '{regex}'");
+                            false
+                        })
+                };
                 Some(JValue::Int(if ok { 1 } else { 0 }))
             }
             ("java/util/Arrays", "hashCode", "([Ljava/lang/Object;)I") => {

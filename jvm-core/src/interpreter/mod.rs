@@ -45,9 +45,62 @@ pub(super) struct MethodExecInfo {
     pub access_flags: u16,
 }
 
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct RegexCacheKey {
+    pattern: String,
+    flags: i32,
+}
+
+struct RegexCache {
+    capacity: usize,
+    order: VecDeque<RegexCacheKey>,
+    entries: HashMap<RegexCacheKey, regex::Regex>,
+}
+
+impl RegexCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            order: VecDeque::new(),
+            entries: HashMap::new(),
+        }
+    }
+
+    fn compile(&mut self, pattern: &str, flags: i32) -> Option<regex::Regex> {
+        let key = RegexCacheKey {
+            pattern: pattern.to_owned(),
+            flags,
+        };
+        if let Some(regex) = self.entries.get(&key).cloned() {
+            self.touch(&key);
+            return Some(regex);
+        }
+
+        let regex = regex::Regex::new(pattern).ok()?;
+        if self.capacity != 0 {
+            while self.entries.len() >= self.capacity {
+                let Some(lru_key) = self.order.pop_front() else {
+                    break;
+                };
+                self.entries.remove(&lru_key);
+            }
+            self.order.push_back(key.clone());
+            self.entries.insert(key, regex.clone());
+        }
+        Some(regex)
+    }
+
+    fn touch(&mut self, key: &RegexCacheKey) {
+        if let Some(pos) = self.order.iter().position(|existing| existing == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LazyClass, Vm};
+    use super::{LazyClass, RegexCache, RegexCacheKey, Vm};
     use std::io::{Cursor, Write};
 
     fn build_misnamed_jar() -> Vec<u8> {
@@ -147,6 +200,28 @@ mod tests {
             );
         }
         assert!(vm.resolve_class("missing/Type").is_none(), "missing class must remain unresolved");
+    }
+
+    #[test]
+    fn regex_cache_evicts_least_recently_used_entry() {
+        let mut cache = RegexCache::new(2);
+        cache.compile("a", 0).expect("compile a");
+        cache.compile("b", 0).expect("compile b");
+        cache.compile("a", 0).expect("touch a");
+        cache.compile("c", 0).expect("compile c");
+
+        assert!(cache.entries.contains_key(&RegexCacheKey {
+            pattern: "a".to_owned(),
+            flags: 0,
+        }));
+        assert!(cache.entries.contains_key(&RegexCacheKey {
+            pattern: "c".to_owned(),
+            flags: 0,
+        }));
+        assert!(!cache.entries.contains_key(&RegexCacheKey {
+            pattern: "b".to_owned(),
+            flags: 0,
+        }));
     }
 
 }
@@ -479,6 +554,8 @@ pub struct Vm {
     /// Method resolution cache: (class, method_name, descriptor) → owner class name.
     /// Avoids repeated super-chain walks for the same method lookup.
     method_owner_cache: HashMap<(String, String, String), Option<String>>,
+    /// Bounded LRU cache for compiled host-side regular expressions.
+    regex_cache: RegexCache,
     /// Materialized non-class resources from loaded JARs, keyed by path.
     pub resources: HashMap<String, Vec<u8>>,
     /// Non-class resources that still point at compressed JAR entries.
@@ -511,10 +588,15 @@ impl Vm {
             scheduler: Scheduler::new(),
             monitors: HashMap::new(),
             method_owner_cache: HashMap::new(),
+            regex_cache: RegexCache::new(64),
             resources: HashMap::new(),
             pending_resources: HashMap::new(),
             jar_archives: Vec::new(),
         }
+    }
+
+    pub(super) fn compile_regex_cached(&mut self, pattern: &str, flags: i32) -> Option<regex::Regex> {
+        self.regex_cache.compile(pattern, flags)
     }
 
     fn read_jar_entry(&mut self, entry: &JarEntryRef) -> Result<Vec<u8>, String> {

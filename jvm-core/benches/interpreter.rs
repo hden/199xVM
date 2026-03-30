@@ -66,6 +66,55 @@ fn bench_virtual_call(c: &mut Criterion) {
     });
 }
 
+fn bench_string_utf16_ascii(c: &mut Criterion) {
+    let bundle = combined_bundle(shim_bundle(), bench_bundle());
+    c.bench_function("string_utf16_ascii_10000x", |b| {
+        b.iter(|| jvm_core::run_static_native(&bundle, "BenchStringUtf16Ascii", "run", "()I"))
+    });
+}
+
+fn bench_string_utf16_cjk(c: &mut Criterion) {
+    let bundle = combined_bundle(shim_bundle(), bench_bundle());
+    c.bench_function("string_utf16_cjk_10000x", |b| {
+        b.iter(|| jvm_core::run_static_native(&bundle, "BenchStringUtf16Cjk", "run", "()I"))
+    });
+}
+
+fn bench_string_utf16_emoji(c: &mut Criterion) {
+    let bundle = combined_bundle(shim_bundle(), bench_bundle());
+    c.bench_function("string_utf16_emoji_10000x", |b| {
+        b.iter(|| jvm_core::run_static_native(&bundle, "BenchStringUtf16Emoji", "run", "()I"))
+    });
+}
+
+fn bench_regex_find_ascii(c: &mut Criterion) {
+    let bundle = combined_bundle(shim_bundle(), bench_bundle());
+    c.bench_function("regex_find_ascii_10000x", |b| {
+        b.iter(|| jvm_core::run_static_native(&bundle, "BenchRegexFindAscii", "run", "()I"))
+    });
+}
+
+fn bench_regex_find_cjk(c: &mut Criterion) {
+    let bundle = combined_bundle(shim_bundle(), bench_bundle());
+    c.bench_function("regex_find_cjk_10000x", |b| {
+        b.iter(|| jvm_core::run_static_native(&bundle, "BenchRegexFindCjk", "run", "()I"))
+    });
+}
+
+fn bench_regex_find_emoji(c: &mut Criterion) {
+    let bundle = combined_bundle(shim_bundle(), bench_bundle());
+    c.bench_function("regex_find_emoji_10000x", |b| {
+        b.iter(|| jvm_core::run_static_native(&bundle, "BenchRegexFindEmoji", "run", "()I"))
+    });
+}
+
+fn bench_regex_find_empty_emoji(c: &mut Criterion) {
+    let bundle = combined_bundle(shim_bundle(), bench_bundle());
+    c.bench_function("regex_find_empty_emoji_10000x", |b| {
+        b.iter(|| jvm_core::run_static_native(&bundle, "BenchRegexFindEmptyEmoji", "run", "()I"))
+    });
+}
+
 /// Measures lazy JAR registration plus first execution of a class loaded from the JAR.
 fn bench_lazy_jar_load_and_run(c: &mut Criterion) {
     c.bench_function("lazy_jar_load_and_run_entry", |b| {
@@ -104,6 +153,13 @@ criterion_group!(
     bench_static_field,
     bench_string_ldc,
     bench_virtual_call,
+    bench_string_utf16_ascii,
+    bench_string_utf16_cjk,
+    bench_string_utf16_emoji,
+    bench_regex_find_ascii,
+    bench_regex_find_cjk,
+    bench_regex_find_emoji,
+    bench_regex_find_empty_emoji,
     bench_lazy_jar_load_and_run,
     bench_lazy_jar_load_and_read_resource
 );
