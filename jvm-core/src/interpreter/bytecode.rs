@@ -93,7 +93,7 @@ impl Vm {
         frame: &mut Frame,
         code: &[u8],
         cp: &[ConstantPoolEntry],
-        _cache: &CpCache,
+        cache: &CpCache,
         class_name: &str,
         bootstrap_methods: &[BootstrapMethod],
         _exception_table: &[ExceptionTableEntry],
@@ -732,7 +732,7 @@ impl Vm {
                 }
                 0xb8 => { // invokestatic
                     let idx = read_u16(code, &mut frame.pc);
-                    self.dispatch_static(cp, idx, frame)?;
+                    self.dispatch_static(cp, cache, idx, frame)?;
                 }
                 0xb9 => { // invokeinterface
                     let idx = read_u16(code, &mut frame.pc);

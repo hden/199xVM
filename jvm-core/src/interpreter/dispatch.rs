@@ -1,10 +1,11 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::class_file::{BootstrapMethod, ConstantPoolEntry};
+use crate::class_file::{BootstrapMethod, ConstantPoolEntry, ExceptionTableEntry};
 use crate::heap::{JObject, JRef, JValue, NativePayload};
 
 use super::Vm;
+use super::cp_cache::{CpCache, CpCacheEntry, ResolvedMethodEntry};
 use super::descriptors::*;
 use super::frame::*;
 use super::trampoline::FrameInfo;
@@ -22,9 +23,42 @@ impl Vm {
     pub(super) fn dispatch_static(
         &mut self,
         cp: &[ConstantPoolEntry],
+        cache: &CpCache,
         idx: u16,
         frame: &mut Frame,
     ) -> Result<Option<JValue>, String> {
+        // ---- FAST PATH: check cpCache for a previously resolved method ----
+        // Extract lightweight metadata from cache with a short borrow.
+        let cached_hit: Option<(bool, usize, bool, String, String, String)> = {
+            let cb = cache.borrow();
+            match cb.get(idx as usize) {
+                Some(Some(CpCacheEntry::Method(e))) => Some((
+                    e.has_code, e.arg_slot_count, e.is_void,
+                    e.owner_class.clone(), e.method_name.clone(), e.descriptor.clone(),
+                )),
+                _ => None,
+            }
+        };
+        if let Some((has_code, arg_slot_count, is_void, owner, mname, desc)) = cached_hit {
+            let args = pop_args(frame, arg_slot_count);
+            if has_code {
+                // Re-borrow to access the full entry for frame construction.
+                let cb = cache.borrow();
+                let entry = match &cb[idx as usize] {
+                    Some(CpCacheEntry::Method(e)) => e,
+                    _ => unreachable!(),
+                };
+                let fi = self.build_frame_from_cache(entry, args, !is_void);
+                *self.pending_frame_mut() = Some(fi);
+                return Ok(None);
+            } else {
+                let result = self.invoke_static(&owner, &mname, &desc, args)?;
+                if !is_void { frame.stack.push(result); }
+                return Ok(None);
+            }
+        }
+
+        // ---- SLOW PATH: first invocation — resolve and populate cache ----
         let (class_name, method_name, descriptor) = resolve_methodref_ref(cp, idx);
         self.ensure_class_init(class_name)?;
         let n_args = count_args(descriptor);
@@ -32,31 +66,135 @@ impl Vm {
 
         // Normalize descriptor and args (varargs synthesis) before branching.
         let orig_args = args.clone();
-        let (desc, args) = match self.prepare_static_args(&class_name, &method_name, &descriptor, args) {
+        let (desc, args) = match self.prepare_static_args(class_name, method_name, descriptor, args) {
             Some(pair) => pair,
             None => {
                 // Method flags not found — fall back to invoke_static with original args.
-                let result = self.invoke_static(&class_name, &method_name, &descriptor, orig_args)?;
+                let result = self.invoke_static(class_name, method_name, descriptor, orig_args)?;
                 if !matches!(result, JValue::Void) { frame.stack.push(result); }
                 return Ok(None);
             }
         };
 
         let push_return = !desc.ends_with(")V");
-        match self.build_static_frame(&class_name, &method_name, &desc, args.clone(), push_return)? {
+
+        // Resolve method exec info for cache population (before building frame).
+        let exec_info = self.resolve_method_exec_info(class_name, method_name, &desc);
+
+        match self.build_static_frame(class_name, method_name, &desc, args.clone(), push_return)? {
             Some(fi) => {
+                // Populate cache using the resolved exec info.
+                if let Some(info) = exec_info {
+                    self.populate_static_method_cache(cache, idx, method_name, &desc, &info);
+                }
                 *self.pending_frame_mut() = Some(fi);
                 Ok(None)
             }
             None => {
-                // Native fallback — args already have varargs synthesis applied.
-                let result = self.invoke_static(&class_name, &method_name, &desc, args)?;
+                // Native method — cache with has_code=false.
+                self.populate_static_native_cache(cache, idx, class_name, method_name, &desc);
+                let result = self.invoke_static(class_name, method_name, &desc, args)?;
                 if !matches!(result, JValue::Void) {
                     frame.stack.push(result);
                 }
                 Ok(None)
             }
         }
+    }
+
+    /// Build a FrameInfo directly from a cached ResolvedMethodEntry (zero resolution).
+    fn build_frame_from_cache(&mut self, entry: &ResolvedMethodEntry, args: Vec<JValue>, push_return: bool) -> FrameInfo {
+        let req: usize = entry.param_tokens.iter()
+            .map(|t| if t == "J" || t == "D" { 2 } else { 1 })
+            .sum();
+        let mut locals = vec![JValue::Void; entry.max_locals.max(req)];
+        let mut li = 0usize;
+        for (a, t) in args.into_iter().zip(entry.param_tokens.iter()) {
+            if li >= locals.len() { break; }
+            locals[li] = self.adapt_value_for_descriptor(t, a);
+            li += if t == "J" || t == "D" { 2 } else { 1 };
+        }
+        let fo = format!("{}.{}{}", entry.owner_class, entry.method_name, entry.descriptor);
+        let synchronized_monitor = if entry.access_flags & 0x0020 != 0 {
+            let class_obj = self.class_object(&entry.owner_class);
+            self.monitor_enter(&class_obj);
+            Some(class_obj)
+        } else {
+            None
+        };
+        FrameInfo {
+            frame: Frame { locals, stack: Vec::new(), pc: 0 },
+            code: (*entry.code).clone(),
+            cp: Rc::clone(&entry.cp),
+            cache: Rc::clone(&entry.cache),
+            frame_owner: fo,
+            bootstrap_methods: (*entry.bootstrap_methods).to_vec(),
+            exception_table: (*entry.exception_table).to_vec(),
+            push_return,
+            concat_state: None,
+            lambda_return_adapt: None,
+            synchronized_monitor,
+        }
+    }
+
+    /// Populate the cpCache with a resolved bytecode method entry.
+    fn populate_static_method_cache(
+        &self,
+        cache: &CpCache,
+        idx: u16,
+        method_name: &str,
+        descriptor: &str,
+        info: &super::MethodExecInfo,
+    ) {
+        let (param_tokens, _) = Self::parse_method_descriptor_tokens(descriptor);
+        let entry = ResolvedMethodEntry {
+            owner_class: info.class_name.clone(),
+            code: Rc::new(info.code.clone()),
+            exception_table: Rc::new(info.exception_table.clone()),
+            max_locals: info.max_locals,
+            arg_slot_count: count_args(descriptor),
+            access_flags: info.access_flags,
+            has_code: info.has_code,
+            cp: Rc::clone(&info.cp),
+            cache: Rc::clone(&info.cache),
+            bootstrap_methods: Rc::new(info.bootstrap_methods.clone()),
+            descriptor: descriptor.to_owned(),
+            param_tokens,
+            is_void: descriptor.ends_with(")V"),
+            is_varargs: info.access_flags & 0x0080 != 0,
+            method_name: method_name.to_owned(),
+        };
+        cache.borrow_mut()[idx as usize] = Some(CpCacheEntry::Method(entry));
+    }
+
+    /// Populate the cpCache with a resolved native method entry.
+    fn populate_static_native_cache(
+        &self,
+        cache: &CpCache,
+        idx: u16,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) {
+        let (param_tokens, _) = Self::parse_method_descriptor_tokens(descriptor);
+        let entry = ResolvedMethodEntry {
+            owner_class: class_name.to_owned(),
+            code: Rc::new(Vec::new()),
+            exception_table: Rc::new(Vec::new()),
+            max_locals: 0,
+            arg_slot_count: count_args(descriptor),
+            access_flags: 0,
+            has_code: false,
+            cp: Rc::new(Vec::new()),
+            cache: Rc::new(RefCell::new(Vec::new())),
+            bootstrap_methods: Rc::new(Vec::new()),
+            descriptor: descriptor.to_owned(),
+            param_tokens,
+            is_void: descriptor.ends_with(")V"),
+            is_varargs: false,
+            method_name: method_name.to_owned(),
+        };
+        cache.borrow_mut()[idx as usize] = Some(CpCacheEntry::Method(entry));
     }
 
     pub(super) fn dispatch_virtual(

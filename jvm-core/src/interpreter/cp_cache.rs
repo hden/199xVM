@@ -23,6 +23,8 @@ pub(crate) struct ResolvedMethodEntry {
     pub has_code: bool,
     /// Shared constant pool of the owning class.
     pub cp: Rc<Vec<ConstantPoolEntry>>,
+    /// cpCache of the owning class (for frame construction).
+    pub cache: CpCache,
     /// Bootstrap methods from the owning class.
     pub bootstrap_methods: Rc<Vec<BootstrapMethod>>,
     /// The resolved descriptor (may differ from call-site for generics).
