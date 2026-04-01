@@ -3,6 +3,7 @@ use crate::class_file::{BootstrapMethod, ConstantPoolEntry, ExceptionTableEntry}
 use crate::heap::{JObject, JValue, NativePayload};
 
 use super::Vm;
+use super::cp_cache::CpCache;
 use super::descriptors::*;
 use super::frame::*;
 
@@ -92,6 +93,7 @@ impl Vm {
         frame: &mut Frame,
         code: &[u8],
         cp: &[ConstantPoolEntry],
+        _cache: &CpCache,
         class_name: &str,
         bootstrap_methods: &[BootstrapMethod],
         _exception_table: &[ExceptionTableEntry],
