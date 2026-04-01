@@ -728,15 +728,15 @@ impl Vm {
                         self.static_fields.entry(owner).or_default().insert(field, val);
                     } else {
                         // Slow path.
-                        let (cls, fld, fd) = resolve_fieldref(cp, idx);
-                        self.ensure_class_init(&cls)?;
-                        self.static_fields.entry(cls.clone()).or_default().insert(fld.clone(), val);
+                        let (cls, fld, fd) = resolve_fieldref_ref(cp, idx);
+                        self.ensure_class_init(cls)?;
+                        self.static_fields.entry(cls.to_owned()).or_default().insert(fld.to_owned(), val);
                         // Populate cache.
                         cache.borrow_mut()[idx as usize] = Some(CpCacheEntry::Field(
                             ResolvedFieldEntry {
-                                owner_class: cls,
-                                field_name: fld,
-                                field_descriptor: fd,
+                                owner_class: cls.to_owned(),
+                                field_name: fld.to_owned(),
+                                field_descriptor: fd.to_owned(),
                             }
                         ));
                     }

@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::class_file::{BootstrapMethod, ConstantPoolEntry, ExceptionTableEntry};
+use crate::class_file::{BootstrapMethod, ConstantPoolEntry};
 use crate::heap::{JObject, JRef, JValue, NativePayload};
 
 use super::Vm;
@@ -28,33 +28,28 @@ impl Vm {
         frame: &mut Frame,
     ) -> Result<Option<JValue>, String> {
         // ---- FAST PATH: check cpCache for a previously resolved method ----
-        // Extract lightweight metadata from cache with a short borrow.
-        let cached_hit: Option<(bool, usize, bool, String, String, String)> = {
+        {
             let cb = cache.borrow();
-            match cb.get(idx as usize) {
-                Some(Some(CpCacheEntry::Method(e))) => Some((
-                    e.has_code, e.arg_slot_count, e.is_void,
-                    e.owner_class.clone(), e.method_name.clone(), e.descriptor.clone(),
-                )),
-                _ => None,
-            }
-        };
-        if let Some((has_code, arg_slot_count, is_void, owner, mname, desc)) = cached_hit {
-            let args = pop_args(frame, arg_slot_count);
-            if has_code {
-                // Re-borrow to access the full entry for frame construction.
-                let cb = cache.borrow();
-                let entry = match &cb[idx as usize] {
-                    Some(CpCacheEntry::Method(e)) => e,
-                    _ => unreachable!(),
-                };
-                let fi = self.build_frame_from_cache(entry, args, !is_void);
-                *self.pending_frame_mut() = Some(fi);
-                return Ok(None);
-            } else {
-                let result = self.invoke_static(&owner, &mname, &desc, args)?;
-                if !is_void { frame.stack.push(result); }
-                return Ok(None);
+            if let Some(Some(CpCacheEntry::Method(entry))) = cb.get(idx as usize) {
+                if entry.has_code {
+                    // Bytecode method — build frame directly, no String clones needed.
+                    let args = pop_args(frame, entry.arg_slot_count);
+                    let fi = self.build_frame_from_cache(entry, args, !entry.is_void);
+                    *self.pending_frame_mut() = Some(fi);
+                    return Ok(None);
+                } else {
+                    // Native method — extract data before releasing borrow.
+                    let owner = entry.owner_class.clone();
+                    let mname = entry.method_name.clone();
+                    let desc = entry.descriptor.clone();
+                    let is_void = entry.is_void;
+                    let arg_slot_count = entry.arg_slot_count;
+                    drop(cb);
+                    let args = pop_args(frame, arg_slot_count);
+                    let result = self.invoke_static(&owner, &mname, &desc, args)?;
+                    if !is_void { frame.stack.push(result); }
+                    return Ok(None);
+                }
             }
         }
 
@@ -78,20 +73,17 @@ impl Vm {
 
         let push_return = !desc.ends_with(")V");
 
-        // Resolve method exec info for cache population (before building frame).
-        let exec_info = self.resolve_method_exec_info(class_name, method_name, &desc);
-
-        match self.build_static_frame(class_name, method_name, &desc, args.clone(), push_return)? {
-            Some(fi) => {
-                // Populate cache using the resolved exec info.
-                if let Some(info) = exec_info {
-                    self.populate_static_method_cache(cache, idx, method_name, &desc, &info);
-                }
+        // Resolve method exec info once (used for both frame building and cache population).
+        match self.resolve_method_exec_info(class_name, method_name, &desc) {
+            Some(info) if info.has_code => {
+                // Bytecode method — build frame and populate cache.
+                let fi = self.build_static_frame_from_exec_info(&info, &desc, args, push_return);
+                self.populate_static_method_cache(cache, idx, method_name, &desc, &info);
                 *self.pending_frame_mut() = Some(fi);
                 Ok(None)
             }
-            None => {
-                // Native method — cache with has_code=false.
+            _ => {
+                // Native or unresolved — cache and fall back to invoke_static.
                 self.populate_static_native_cache(cache, idx, class_name, method_name, &desc);
                 let result = self.invoke_static(class_name, method_name, &desc, args)?;
                 if !matches!(result, JValue::Void) {
@@ -99,6 +91,48 @@ impl Vm {
                 }
                 Ok(None)
             }
+        }
+    }
+
+    /// Build a FrameInfo from a pre-resolved MethodExecInfo (avoids double resolution).
+    fn build_static_frame_from_exec_info(
+        &mut self,
+        info: &super::MethodExecInfo,
+        descriptor: &str,
+        args: Vec<JValue>,
+        push_return: bool,
+    ) -> FrameInfo {
+        let (param_tokens, _) = Self::parse_method_descriptor_tokens(descriptor);
+        let req: usize = param_tokens.iter()
+            .map(|t| if t == "J" || t == "D" { 2 } else { 1 })
+            .sum();
+        let mut locals = vec![JValue::Void; info.max_locals.max(req)];
+        let mut li = 0usize;
+        for (a, t) in args.into_iter().zip(param_tokens.iter()) {
+            if li >= locals.len() { break; }
+            locals[li] = self.adapt_value_for_descriptor(t, a);
+            li += if t == "J" || t == "D" { 2 } else { 1 };
+        }
+        let fo = format!("{}.{}", info.class_name, info.descriptor);
+        let synchronized_monitor = if info.access_flags & 0x0020 != 0 {
+            let class_obj = self.class_object(&info.class_name);
+            self.monitor_enter(&class_obj);
+            Some(class_obj)
+        } else {
+            None
+        };
+        FrameInfo {
+            frame: Frame { locals, stack: Vec::new(), pc: 0 },
+            code: info.code.clone(),
+            cp: Rc::clone(&info.cp),
+            cache: Rc::clone(&info.cache),
+            frame_owner: fo,
+            bootstrap_methods: info.bootstrap_methods.clone(),
+            exception_table: info.exception_table.clone(),
+            push_return,
+            concat_state: None,
+            lambda_return_adapt: None,
+            synchronized_monitor,
         }
     }
 
