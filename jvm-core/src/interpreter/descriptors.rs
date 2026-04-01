@@ -81,21 +81,26 @@ pub(super) fn resolve_class_name_ref<'a>(cp: &'a [ConstantPoolEntry], idx: u16) 
 }
 
 pub(super) fn resolve_methodref(cp: &[ConstantPoolEntry], idx: u16) -> (String, String, String) {
+    let (a, b, c) = resolve_methodref_ref(cp, idx);
+    (a.to_owned(), b.to_owned(), c.to_owned())
+}
+
+pub(super) fn resolve_methodref_ref<'a>(cp: &'a [ConstantPoolEntry], idx: u16) -> (&'a str, &'a str, &'a str) {
     let (class_idx, nat_idx) = match &cp[idx as usize] {
         ConstantPoolEntry::Methodref { class_index, name_and_type_index }
         | ConstantPoolEntry::InterfaceMethodref { class_index, name_and_type_index } => {
             (*class_index, *name_and_type_index)
         }
-        _ => return (String::new(), String::new(), String::new()),
+        _ => return ("", "", ""),
     };
-    let class_name = resolve_class_name(cp, class_idx);
+    let class_name = resolve_class_name_ref(cp, class_idx);
     let (name, desc) = match &cp[nat_idx as usize] {
         ConstantPoolEntry::NameAndType { name_index, descriptor_index } => {
-            let n = match &cp[*name_index as usize] { ConstantPoolEntry::Utf8(s) => s.clone(), _ => String::new() };
-            let d = match &cp[*descriptor_index as usize] { ConstantPoolEntry::Utf8(s) => s.clone(), _ => String::new() };
+            let n = match &cp[*name_index as usize] { ConstantPoolEntry::Utf8(s) => s.as_str(), _ => "" };
+            let d = match &cp[*descriptor_index as usize] { ConstantPoolEntry::Utf8(s) => s.as_str(), _ => "" };
             (n, d)
         }
-        _ => (String::new(), String::new()),
+        _ => ("", ""),
     };
     (class_name, name, desc)
 }

@@ -25,9 +25,9 @@ impl Vm {
         idx: u16,
         frame: &mut Frame,
     ) -> Result<Option<JValue>, String> {
-        let (class_name, method_name, descriptor) = resolve_methodref(cp, idx);
-        self.ensure_class_init(&class_name)?;
-        let n_args = count_args(&descriptor);
+        let (class_name, method_name, descriptor) = resolve_methodref_ref(cp, idx);
+        self.ensure_class_init(class_name)?;
+        let n_args = count_args(descriptor);
         let args = pop_args(frame, n_args);
 
         // Normalize descriptor and args (varargs synthesis) before branching.
@@ -65,8 +65,8 @@ impl Vm {
         idx: u16,
         frame: &mut Frame,
     ) -> Result<Option<JValue>, String> {
-        let (class_name, method_name, descriptor) = resolve_methodref(cp, idx);
-        let n_args = count_args(&descriptor);
+        let (class_name, method_name, descriptor) = resolve_methodref_ref(cp, idx);
+        let n_args = count_args(descriptor);
         let args = pop_args(frame, n_args);
         let this_val = frame.stack.pop().unwrap();
         match this_val {
@@ -156,8 +156,8 @@ impl Vm {
         idx: u16,
         frame: &mut Frame,
     ) -> Result<Option<JValue>, String> {
-        let (class_name, method_name, descriptor) = resolve_methodref(cp, idx);
-        let n_args = count_args(&descriptor);
+        let (class_name, method_name, descriptor) = resolve_methodref_ref(cp, idx);
+        let n_args = count_args(descriptor);
         let args = pop_args(frame, n_args);
         let this_val = frame.stack.pop().unwrap();
         match this_val {
@@ -201,8 +201,8 @@ impl Vm {
         idx: u16,
         frame: &mut Frame,
     ) -> Result<Option<JValue>, String> {
-        let (class_name, method_name, descriptor) = resolve_methodref(cp, idx);
-        let n_args = count_args(&descriptor);
+        let (class_name, method_name, descriptor) = resolve_methodref_ref(cp, idx);
+        let n_args = count_args(descriptor);
         let args = pop_args(frame, n_args);
 
         let is_static = self.find_method_flags(&class_name, &method_name, &descriptor)
