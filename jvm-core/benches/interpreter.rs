@@ -157,7 +157,7 @@ fn bench_classloader_get_resource_as_stream(c: &mut Criterion) {
         b.iter(|| {
             let mut vm = jvm_core::interpreter::Vm::new();
             jvm_core::load_bundle(&mut vm, shim_bundle());
-            vm.load_jar(test_jar()).expect("load test jar");
+            vm.load_jar(jar_loader_test_jar()).expect("load test jar");
 
             let class_loader = match vm
                 .invoke_static("java/lang/ClassLoader", "getSystemClassLoader", "()Ljava/lang/ClassLoader;", vec![])
