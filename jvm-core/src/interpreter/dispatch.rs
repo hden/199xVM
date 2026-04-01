@@ -77,7 +77,7 @@ impl Vm {
         match self.resolve_method_exec_info(class_name, method_name, &desc) {
             Some(info) if info.has_code => {
                 // Bytecode method — build frame and populate cache.
-                let fi = self.build_static_frame_from_exec_info(&info, &desc, args, push_return);
+                let fi = self.build_static_frame_from_exec_info(&info, method_name, &desc, args, push_return);
                 self.populate_static_method_cache(cache, idx, method_name, &desc, &info);
                 *self.pending_frame_mut() = Some(fi);
                 Ok(None)
@@ -98,6 +98,7 @@ impl Vm {
     fn build_static_frame_from_exec_info(
         &mut self,
         info: &super::MethodExecInfo,
+        method_name: &str,
         descriptor: &str,
         args: Vec<JValue>,
         push_return: bool,
@@ -113,7 +114,7 @@ impl Vm {
             locals[li] = self.adapt_value_for_descriptor(t, a);
             li += if t == "J" || t == "D" { 2 } else { 1 };
         }
-        let fo = format!("{}.{}", info.class_name, info.descriptor);
+        let fo = format!("{}.{method_name}{}", info.class_name, info.descriptor);
         let synchronized_monitor = if info.access_flags & 0x0020 != 0 {
             let class_obj = self.class_object(&info.class_name);
             self.monitor_enter(&class_obj);

@@ -678,21 +678,19 @@ impl Vm {
                 0xb2 => { // getstatic
                     let idx = read_u16(code, &mut frame.pc);
                     // Fast path: check cpCache for resolved field.
-                    let cached = {
+                    let cached_val = {
                         let cb = cache.borrow();
-                        match cb.get(idx as usize) {
-                            Some(Some(CpCacheEntry::Field(e))) => Some((
-                                e.owner_class.clone(), e.field_name.clone(),
-                                e.field_descriptor.clone(),
-                            )),
-                            _ => None,
+                        if let Some(Some(CpCacheEntry::Field(e))) = cb.get(idx as usize) {
+                            let v = self.static_fields.get(&e.owner_class)
+                                .and_then(|m| m.get(&e.field_name))
+                                .cloned()
+                                .unwrap_or_else(|| default_value_for_descriptor(&e.field_descriptor));
+                            Some(v)
+                        } else {
+                            None
                         }
                     };
-                    if let Some((owner, field, desc)) = cached {
-                        let v = self.static_fields.get(&owner)
-                            .and_then(|m| m.get(&field))
-                            .cloned()
-                            .unwrap_or_else(|| default_value_for_descriptor(&desc));
+                    if let Some(v) = cached_val {
                         frame.stack.push(v);
                     } else {
                         // Slow path: resolve, push, then populate cache.

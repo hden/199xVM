@@ -33,7 +33,8 @@ pub(crate) struct ResolvedMethodEntry {
     pub param_tokens: Vec<String>,
     /// Whether the method returns void.
     pub is_void: bool,
-    /// Whether the method is ACC_VARARGS.
+    /// Whether the method is ACC_VARARGS (reserved for future varargs fast path).
+    #[allow(dead_code)]
     pub is_varargs: bool,
     /// The method name (for frame_owner formatting).
     pub method_name: String,
@@ -61,9 +62,5 @@ pub(crate) type CpCache = Rc<RefCell<Vec<Option<CpCacheEntry>>>>;
 
 /// Create a new empty cpCache of the given size.
 pub(crate) fn new_cp_cache(size: usize) -> CpCache {
-    let mut v = Vec::with_capacity(size);
-    for _ in 0..size {
-        v.push(None);
-    }
-    Rc::new(RefCell::new(v))
+    Rc::new(RefCell::new((0..size).map(|_| None).collect()))
 }
