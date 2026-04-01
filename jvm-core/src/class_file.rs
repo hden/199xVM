@@ -5,6 +5,8 @@
 
 use std::rc::Rc;
 
+use crate::interpreter::cp_cache::{self, CpCache};
+
 /// Magic number that starts every `.class` file.
 const MAGIC: u32 = 0xCAFE_BABE;
 
@@ -27,14 +29,38 @@ pub struct ClassFile {
 ///
 /// `entries` is wrapped in `Rc` so cloning the constant pool (e.g. when
 /// passing it to `run_frame`) is O(1) instead of O(n).
-#[derive(Debug, Clone)]
 pub struct ConstantPool {
     pub(crate) entries: Rc<Vec<ConstantPoolEntry>>,
+    /// Per-constant-pool resolution cache (HotSpot cpCache pattern).
+    /// Lazily populated on first use of each entry.
+    pub(crate) cache: CpCache,
+}
+
+impl std::fmt::Debug for ConstantPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConstantPool")
+            .field("entries", &self.entries)
+            .field("cache_len", &self.cache.borrow().len())
+            .finish()
+    }
+}
+
+impl Clone for ConstantPool {
+    fn clone(&self) -> Self {
+        Self {
+            entries: Rc::clone(&self.entries),
+            cache: Rc::clone(&self.cache),
+        }
+    }
 }
 
 impl ConstantPool {
     fn new(entries: Vec<ConstantPoolEntry>) -> Self {
-        Self { entries: Rc::new(entries) }
+        let len = entries.len();
+        Self {
+            entries: Rc::new(entries),
+            cache: cp_cache::new_cp_cache(len),
+        }
     }
 
     /// Get entry at 1-based index.

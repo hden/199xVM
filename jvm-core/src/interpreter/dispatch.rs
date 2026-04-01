@@ -5,6 +5,7 @@ use crate::class_file::{BootstrapMethod, ConstantPoolEntry};
 use crate::heap::{JObject, JRef, JValue, NativePayload};
 
 use super::Vm;
+use super::cp_cache::{CpCache, CpCacheEntry, ResolvedMethodEntry};
 use super::descriptors::*;
 use super::frame::*;
 use super::trampoline::FrameInfo;
@@ -22,35 +23,69 @@ impl Vm {
     pub(super) fn dispatch_static(
         &mut self,
         cp: &[ConstantPoolEntry],
+        cache: &CpCache,
         idx: u16,
         frame: &mut Frame,
     ) -> Result<Option<JValue>, String> {
-        let (class_name, method_name, descriptor) = resolve_methodref(cp, idx);
-        self.ensure_class_init(&class_name)?;
-        let n_args = count_args(&descriptor);
+        // ---- FAST PATH: check cpCache for a previously resolved method ----
+        {
+            let cb = cache.borrow();
+            if let Some(Some(CpCacheEntry::Method(entry))) = cb.get(idx as usize) {
+                if entry.has_code {
+                    // Bytecode method — build frame directly, no String clones needed.
+                    let args = pop_args(frame, entry.arg_slot_count);
+                    let fi = self.build_frame_from_cache(entry, args, !entry.is_void);
+                    *self.pending_frame_mut() = Some(fi);
+                    return Ok(None);
+                } else {
+                    // Native method — extract data before releasing borrow.
+                    let owner = entry.owner_class.clone();
+                    let mname = entry.method_name.clone();
+                    let desc = entry.descriptor.clone();
+                    let is_void = entry.is_void;
+                    let arg_slot_count = entry.arg_slot_count;
+                    drop(cb);
+                    let args = pop_args(frame, arg_slot_count);
+                    let result = self.invoke_static(&owner, &mname, &desc, args)?;
+                    if !is_void { frame.stack.push(result); }
+                    return Ok(None);
+                }
+            }
+        }
+
+        // ---- SLOW PATH: first invocation — resolve and populate cache ----
+        let (class_name, method_name, descriptor) = resolve_methodref_ref(cp, idx);
+        self.ensure_class_init(class_name)?;
+        let n_args = count_args(descriptor);
         let args = pop_args(frame, n_args);
 
         // Normalize descriptor and args (varargs synthesis) before branching.
         let orig_args = args.clone();
-        let (desc, args) = match self.prepare_static_args(&class_name, &method_name, &descriptor, args) {
+        let (desc, args) = match self.prepare_static_args(class_name, method_name, descriptor, args) {
             Some(pair) => pair,
             None => {
                 // Method flags not found — fall back to invoke_static with original args.
-                let result = self.invoke_static(&class_name, &method_name, &descriptor, orig_args)?;
+                let result = self.invoke_static(class_name, method_name, descriptor, orig_args)?;
                 if !matches!(result, JValue::Void) { frame.stack.push(result); }
                 return Ok(None);
             }
         };
 
         let push_return = !desc.ends_with(")V");
-        match self.build_static_frame(&class_name, &method_name, &desc, args.clone(), push_return)? {
-            Some(fi) => {
+
+        // Resolve method exec info once (used for both frame building and cache population).
+        match self.resolve_method_exec_info(class_name, method_name, &desc) {
+            Some(info) if info.has_code => {
+                // Bytecode method — build frame and populate cache.
+                let fi = self.build_static_frame_from_exec_info(&info, method_name, &desc, args, push_return);
+                self.populate_static_method_cache(cache, idx, method_name, &desc, &info);
                 *self.pending_frame_mut() = Some(fi);
                 Ok(None)
             }
-            None => {
-                // Native fallback — args already have varargs synthesis applied.
-                let result = self.invoke_static(&class_name, &method_name, &desc, args)?;
+            _ => {
+                // Native or unresolved — cache and fall back to invoke_static.
+                self.populate_static_native_cache(cache, idx, class_name, method_name, &desc);
+                let result = self.invoke_static(class_name, method_name, &desc, args)?;
                 if !matches!(result, JValue::Void) {
                     frame.stack.push(result);
                 }
@@ -59,14 +94,152 @@ impl Vm {
         }
     }
 
+    /// Build a FrameInfo from a pre-resolved MethodExecInfo (avoids double resolution).
+    fn build_static_frame_from_exec_info(
+        &mut self,
+        info: &super::MethodExecInfo,
+        method_name: &str,
+        descriptor: &str,
+        args: Vec<JValue>,
+        push_return: bool,
+    ) -> FrameInfo {
+        let (param_tokens, _) = Self::parse_method_descriptor_tokens(descriptor);
+        let req: usize = param_tokens.iter()
+            .map(|t| if t == "J" || t == "D" { 2 } else { 1 })
+            .sum();
+        let mut locals = vec![JValue::Void; info.max_locals.max(req)];
+        let mut li = 0usize;
+        for (a, t) in args.into_iter().zip(param_tokens.iter()) {
+            if li >= locals.len() { break; }
+            locals[li] = self.adapt_value_for_descriptor(t, a);
+            li += if t == "J" || t == "D" { 2 } else { 1 };
+        }
+        let fo = format!("{}.{method_name}{}", info.class_name, info.descriptor);
+        let synchronized_monitor = if info.access_flags & 0x0020 != 0 {
+            let class_obj = self.class_object(&info.class_name);
+            self.monitor_enter(&class_obj);
+            Some(class_obj)
+        } else {
+            None
+        };
+        FrameInfo {
+            frame: Frame { locals, stack: Vec::new(), pc: 0 },
+            code: info.code.clone(),
+            cp: Rc::clone(&info.cp),
+            cache: Rc::clone(&info.cache),
+            frame_owner: fo,
+            bootstrap_methods: info.bootstrap_methods.clone(),
+            exception_table: info.exception_table.clone(),
+            push_return,
+            concat_state: None,
+            lambda_return_adapt: None,
+            synchronized_monitor,
+        }
+    }
+
+    /// Build a FrameInfo directly from a cached ResolvedMethodEntry (zero resolution).
+    fn build_frame_from_cache(&mut self, entry: &ResolvedMethodEntry, args: Vec<JValue>, push_return: bool) -> FrameInfo {
+        let req: usize = entry.param_tokens.iter()
+            .map(|t| if t == "J" || t == "D" { 2 } else { 1 })
+            .sum();
+        let mut locals = vec![JValue::Void; entry.max_locals.max(req)];
+        let mut li = 0usize;
+        for (a, t) in args.into_iter().zip(entry.param_tokens.iter()) {
+            if li >= locals.len() { break; }
+            locals[li] = self.adapt_value_for_descriptor(t, a);
+            li += if t == "J" || t == "D" { 2 } else { 1 };
+        }
+        let fo = format!("{}.{}{}", entry.owner_class, entry.method_name, entry.descriptor);
+        let synchronized_monitor = if entry.access_flags & 0x0020 != 0 {
+            let class_obj = self.class_object(&entry.owner_class);
+            self.monitor_enter(&class_obj);
+            Some(class_obj)
+        } else {
+            None
+        };
+        FrameInfo {
+            frame: Frame { locals, stack: Vec::new(), pc: 0 },
+            code: (*entry.code).clone(),
+            cp: Rc::clone(&entry.cp),
+            cache: Rc::clone(&entry.cache),
+            frame_owner: fo,
+            bootstrap_methods: (*entry.bootstrap_methods).to_vec(),
+            exception_table: (*entry.exception_table).to_vec(),
+            push_return,
+            concat_state: None,
+            lambda_return_adapt: None,
+            synchronized_monitor,
+        }
+    }
+
+    /// Populate the cpCache with a resolved bytecode method entry.
+    fn populate_static_method_cache(
+        &self,
+        cache: &CpCache,
+        idx: u16,
+        method_name: &str,
+        descriptor: &str,
+        info: &super::MethodExecInfo,
+    ) {
+        let (param_tokens, _) = Self::parse_method_descriptor_tokens(descriptor);
+        let entry = ResolvedMethodEntry {
+            owner_class: info.class_name.clone(),
+            code: Rc::new(info.code.clone()),
+            exception_table: Rc::new(info.exception_table.clone()),
+            max_locals: info.max_locals,
+            arg_slot_count: count_args(descriptor),
+            access_flags: info.access_flags,
+            has_code: info.has_code,
+            cp: Rc::clone(&info.cp),
+            cache: Rc::clone(&info.cache),
+            bootstrap_methods: Rc::new(info.bootstrap_methods.clone()),
+            descriptor: descriptor.to_owned(),
+            param_tokens,
+            is_void: descriptor.ends_with(")V"),
+            is_varargs: info.access_flags & 0x0080 != 0,
+            method_name: method_name.to_owned(),
+        };
+        cache.borrow_mut()[idx as usize] = Some(CpCacheEntry::Method(entry));
+    }
+
+    /// Populate the cpCache with a resolved native method entry.
+    fn populate_static_native_cache(
+        &self,
+        cache: &CpCache,
+        idx: u16,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) {
+        let (param_tokens, _) = Self::parse_method_descriptor_tokens(descriptor);
+        let entry = ResolvedMethodEntry {
+            owner_class: class_name.to_owned(),
+            code: Rc::new(Vec::new()),
+            exception_table: Rc::new(Vec::new()),
+            max_locals: 0,
+            arg_slot_count: count_args(descriptor),
+            access_flags: 0,
+            has_code: false,
+            cp: Rc::new(Vec::new()),
+            cache: Rc::new(RefCell::new(Vec::new())),
+            bootstrap_methods: Rc::new(Vec::new()),
+            descriptor: descriptor.to_owned(),
+            param_tokens,
+            is_void: descriptor.ends_with(")V"),
+            is_varargs: false,
+            method_name: method_name.to_owned(),
+        };
+        cache.borrow_mut()[idx as usize] = Some(CpCacheEntry::Method(entry));
+    }
+
     pub(super) fn dispatch_virtual(
         &mut self,
         cp: &[ConstantPoolEntry],
         idx: u16,
         frame: &mut Frame,
     ) -> Result<Option<JValue>, String> {
-        let (class_name, method_name, descriptor) = resolve_methodref(cp, idx);
-        let n_args = count_args(&descriptor);
+        let (class_name, method_name, descriptor) = resolve_methodref_ref(cp, idx);
+        let n_args = count_args(descriptor);
         let args = pop_args(frame, n_args);
         let this_val = frame.stack.pop().unwrap();
         match this_val {
@@ -156,8 +329,8 @@ impl Vm {
         idx: u16,
         frame: &mut Frame,
     ) -> Result<Option<JValue>, String> {
-        let (class_name, method_name, descriptor) = resolve_methodref(cp, idx);
-        let n_args = count_args(&descriptor);
+        let (class_name, method_name, descriptor) = resolve_methodref_ref(cp, idx);
+        let n_args = count_args(descriptor);
         let args = pop_args(frame, n_args);
         let this_val = frame.stack.pop().unwrap();
         match this_val {
@@ -201,8 +374,8 @@ impl Vm {
         idx: u16,
         frame: &mut Frame,
     ) -> Result<Option<JValue>, String> {
-        let (class_name, method_name, descriptor) = resolve_methodref(cp, idx);
-        let n_args = count_args(&descriptor);
+        let (class_name, method_name, descriptor) = resolve_methodref_ref(cp, idx);
+        let n_args = count_args(descriptor);
         let args = pop_args(frame, n_args);
 
         let is_static = self.find_method_flags(&class_name, &method_name, &descriptor)
