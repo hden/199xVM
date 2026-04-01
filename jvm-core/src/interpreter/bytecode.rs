@@ -3,7 +3,7 @@ use crate::class_file::{BootstrapMethod, ConstantPoolEntry, ExceptionTableEntry}
 use crate::heap::{JObject, JValue, NativePayload};
 
 use super::Vm;
-use super::cp_cache::CpCache;
+use super::cp_cache::{CpCache, CpCacheEntry, ResolvedFieldEntry};
 use super::descriptors::*;
 use super::frame::*;
 
@@ -677,16 +677,69 @@ impl Vm {
                 // ---- Field access ----
                 0xb2 => { // getstatic
                     let idx = read_u16(code, &mut frame.pc);
-                    let v = self.resolve_static_field(cp, idx)?;
-                    frame.stack.push(v);
+                    // Fast path: check cpCache for resolved field.
+                    let cached = {
+                        let cb = cache.borrow();
+                        match cb.get(idx as usize) {
+                            Some(Some(CpCacheEntry::Field(e))) => Some((
+                                e.owner_class.clone(), e.field_name.clone(),
+                                e.field_descriptor.clone(),
+                            )),
+                            _ => None,
+                        }
+                    };
+                    if let Some((owner, field, desc)) = cached {
+                        let v = self.static_fields.get(&owner)
+                            .and_then(|m| m.get(&field))
+                            .cloned()
+                            .unwrap_or_else(|| default_value_for_descriptor(&desc));
+                        frame.stack.push(v);
+                    } else {
+                        // Slow path: resolve, push, then populate cache.
+                        let v = self.resolve_static_field(cp, idx)?;
+                        frame.stack.push(v.clone());
+                        // Populate cache with the resolved field owner.
+                        let (cn, fn_, fd) = resolve_fieldref_ref(cp, idx);
+                        let owner = self.find_static_field_owner_class(cn, fn_)
+                            .unwrap_or_else(|| cn.to_owned());
+                        cache.borrow_mut()[idx as usize] = Some(CpCacheEntry::Field(
+                            ResolvedFieldEntry {
+                                owner_class: owner,
+                                field_name: fn_.to_owned(),
+                                field_descriptor: fd.to_owned(),
+                            }
+                        ));
+                    }
                 }
                 0xb3 => { // putstatic
                     let idx = read_u16(code, &mut frame.pc);
                     let val = frame.stack.pop().unwrap_or(JValue::Void);
-                    let (cls, fld, _) = resolve_fieldref(cp, idx);
-                    // Per JVMS §5.5: putstatic triggers class initialization.
-                    self.ensure_class_init(&cls)?;
-                    self.static_fields.entry(cls).or_default().insert(fld, val);
+                    // Fast path: check cpCache.
+                    let cached = {
+                        let cb = cache.borrow();
+                        match cb.get(idx as usize) {
+                            Some(Some(CpCacheEntry::Field(e))) => Some((
+                                e.owner_class.clone(), e.field_name.clone(),
+                            )),
+                            _ => None,
+                        }
+                    };
+                    if let Some((owner, field)) = cached {
+                        self.static_fields.entry(owner).or_default().insert(field, val);
+                    } else {
+                        // Slow path.
+                        let (cls, fld, fd) = resolve_fieldref(cp, idx);
+                        self.ensure_class_init(&cls)?;
+                        self.static_fields.entry(cls.clone()).or_default().insert(fld.clone(), val);
+                        // Populate cache.
+                        cache.borrow_mut()[idx as usize] = Some(CpCacheEntry::Field(
+                            ResolvedFieldEntry {
+                                owner_class: cls,
+                                field_name: fld,
+                                field_descriptor: fd,
+                            }
+                        ));
+                    }
                 }
                 0xb4 => { // getfield
                     let idx = read_u16(code, &mut frame.pc);
@@ -1069,6 +1122,38 @@ impl Vm {
         for iface_name in iface_names {
             if let Some(v) = self.resolve_static_field_in_hierarchy(&iface_name, field_name) {
                 return Some(v);
+            }
+        }
+        None
+    }
+
+    /// Walk the class hierarchy to find which class owns a static field.
+    fn find_static_field_owner_class(&mut self, class_name: &str, field_name: &str) -> Option<String> {
+        if self.static_fields.get(class_name).and_then(|m| m.get(field_name)).is_some() {
+            return Some(class_name.to_owned());
+        }
+        self.ensure_class_ready(class_name);
+        let (super_name, iface_names) = if let Some(class) = self.get_class(class_name) {
+            let sup = if class.super_class != 0 {
+                Some(class.constant_pool.class_name(class.super_class).to_owned())
+            } else {
+                None
+            };
+            let ifaces: Vec<String> = class.interfaces.iter()
+                .map(|&idx| class.constant_pool.class_name(idx).to_owned())
+                .collect();
+            (sup, ifaces)
+        } else {
+            (None, vec![])
+        };
+        if let Some(s) = super_name {
+            if let Some(owner) = self.find_static_field_owner_class(&s, field_name) {
+                return Some(owner);
+            }
+        }
+        for iface in iface_names {
+            if let Some(owner) = self.find_static_field_owner_class(&iface, field_name) {
+                return Some(owner);
             }
         }
         None
