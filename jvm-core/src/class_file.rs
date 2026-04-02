@@ -10,6 +10,69 @@ use crate::interpreter::cp_cache::{self, CpCache};
 /// Magic number that starts every `.class` file.
 const MAGIC: u32 = 0xCAFE_BABE;
 
+fn utf16_units_to_string(utf16: &[u16]) -> Result<String, String> {
+    let mut out = String::new();
+    for decoded in std::char::decode_utf16(utf16.iter().copied()) {
+        match decoded {
+            Ok(ch) => out.push(ch),
+            Err(err) => {
+                return Err(format!(
+                    "Modified UTF-8 contains unpaired surrogate: 0x{:04X}",
+                    err.unpaired_surrogate()
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn decode_modified_utf8(bytes: &[u8]) -> Result<String, String> {
+    let mut utf16 = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b0 = bytes[i];
+        if b0 & 0x80 == 0 {
+            if b0 == 0 {
+                return Err("Modified UTF-8 contains raw NUL byte".to_owned());
+            }
+            utf16.push(u16::from(b0));
+            i += 1;
+            continue;
+        }
+        if b0 & 0xE0 == 0xC0 {
+            if i + 1 >= bytes.len() {
+                return Err("Truncated Modified UTF-8 two-byte sequence".to_owned());
+            }
+            let b1 = bytes[i + 1];
+            if b1 & 0xC0 != 0x80 {
+                return Err("Invalid Modified UTF-8 continuation byte".to_owned());
+            }
+            let value = (u16::from(b0 & 0x1F) << 6) | u16::from(b1 & 0x3F);
+            utf16.push(value);
+            i += 2;
+            continue;
+        }
+        if b0 & 0xF0 == 0xE0 {
+            if i + 2 >= bytes.len() {
+                return Err("Truncated Modified UTF-8 three-byte sequence".to_owned());
+            }
+            let b1 = bytes[i + 1];
+            let b2 = bytes[i + 2];
+            if (b1 & 0xC0 != 0x80) || (b2 & 0xC0 != 0x80) {
+                return Err("Invalid Modified UTF-8 continuation byte".to_owned());
+            }
+            let value = (u16::from(b0 & 0x0F) << 12)
+                | (u16::from(b1 & 0x3F) << 6)
+                | u16::from(b2 & 0x3F);
+            utf16.push(value);
+            i += 3;
+            continue;
+        }
+        return Err(format!("Unsupported Modified UTF-8 leading byte: 0x{b0:02X}"));
+    }
+    utf16_units_to_string(&utf16)
+}
+
 /// A parsed Java class file.
 #[derive(Debug)]
 pub struct ClassFile {
@@ -399,7 +462,7 @@ pub fn parse_class_name(data: &[u8]) -> Option<String> {
 
     // Decode only the single target Utf8 entry.
     let (start, len) = utf8_spans[name_index]?;
-    Some(String::from_utf8_lossy(&data[start..start + len]).into_owned())
+    decode_modified_utf8(&data[start..start + len]).ok()
 }
 
 /// Parse a `.class` file from raw bytes.
@@ -487,7 +550,7 @@ fn parse_constant_pool(r: &mut Reader, count: u16) -> Result<ConstantPool, Strin
                 let length = r.u16() as usize;
                 let bytes = r.bytes(length);
                 // Modified UTF-8 — for ASCII-heavy Java class names this is fine.
-                let s = String::from_utf8_lossy(&bytes).into_owned();
+                let s = decode_modified_utf8(&bytes)?;
                 ConstantPoolEntry::Utf8(s)
             }
             3 => ConstantPoolEntry::Integer(r.i32()),
@@ -793,5 +856,18 @@ mod tests {
         let mut b: Vec<u8> = vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x3D];
         b.push(0xEA); b.push(0x60); // cp_count = 60000
         assert_eq!(parse_class_name(&b), None);
+    }
+
+    #[test]
+    fn test_decode_modified_utf8_supplementary_scalar() {
+        let bytes = [0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80];
+        assert_eq!(decode_modified_utf8(&bytes).as_deref(), Ok("😀"));
+    }
+
+    #[test]
+    fn test_decode_modified_utf8_rejects_unpaired_surrogate() {
+        let bytes = [0xED, 0xA0, 0xBD];
+        let err = decode_modified_utf8(&bytes).expect_err("must reject lone surrogate");
+        assert!(err.contains("unpaired surrogate"), "unexpected error: {err}");
     }
 }

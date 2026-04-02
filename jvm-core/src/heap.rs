@@ -6,7 +6,110 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+
+/// Native backing storage for `java.lang.String`.
+///
+/// The canonical payload is UTF-16 code units so VM-visible string indices can
+/// follow Java semantics even when the content includes surrogate pairs or lone
+/// surrogates created by slicing.
+#[derive(Clone)]
+pub struct JavaStringValue {
+    utf16: Vec<u16>,
+    utf8: Option<String>,
+}
+
+impl JavaStringValue {
+    pub fn new(s: impl Into<String>) -> Self {
+        let utf8 = s.into();
+        Self {
+            utf16: utf8.encode_utf16().collect(),
+            utf8: Some(utf8),
+        }
+    }
+
+    pub fn from_utf16(utf16: Vec<u16>) -> Self {
+        let utf8 = String::from_utf16(&utf16).ok();
+        Self { utf16, utf8 }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        self.utf8.as_deref()
+    }
+
+    pub fn to_string_lossy(&self) -> String {
+        self.utf8
+            .clone()
+            .unwrap_or_else(|| String::from_utf16_lossy(&self.utf16))
+    }
+
+    pub fn utf16(&self) -> &[u16] {
+        &self.utf16
+    }
+
+    pub fn len_utf16(&self) -> usize {
+        self.utf16.len()
+    }
+
+    pub fn code_unit_at(&self, index: usize) -> Option<u16> {
+        self.utf16.get(index).copied()
+    }
+
+    pub fn slice_utf16(&self, start: usize, end: usize) -> Vec<u16> {
+        let len = self.utf16.len();
+        let start = start.min(len);
+        let end = end.min(len).max(start);
+        self.utf16[start..end].to_vec()
+    }
+
+    pub fn concat(&self, other: &Self) -> Self {
+        let mut utf16 = Vec::with_capacity(self.utf16.len() + other.utf16.len());
+        utf16.extend_from_slice(&self.utf16);
+        utf16.extend_from_slice(&other.utf16);
+        let utf8 = match (&self.utf8, &other.utf8) {
+            (Some(left), Some(right)) => {
+                let mut s = String::with_capacity(left.len() + right.len());
+                s.push_str(left);
+                s.push_str(right);
+                Some(s)
+            }
+            _ => None,
+        };
+        Self { utf16, utf8 }
+    }
+
+    pub fn hash_code(&self) -> i32 {
+        self.utf16.iter().fold(0i32, |hash, code_unit| {
+            hash.wrapping_mul(31).wrapping_add(i32::from(*code_unit))
+        })
+    }
+}
+
+impl PartialEq for JavaStringValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.utf16 == other.utf16
+    }
+}
+
+impl Eq for JavaStringValue {}
+
+impl Hash for JavaStringValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.utf16.hash(state);
+    }
+}
+
+impl std::fmt::Debug for JavaStringValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "JavaStringValue({:?}, utf16_len={})",
+            self.to_string_lossy(),
+            self.utf16.len()
+        )
+    }
+}
 
 /// A Java value that can appear on the operand stack or in a local variable slot.
 #[derive(Debug, Clone)]
@@ -91,7 +194,7 @@ pub struct JObject {
 pub enum NativePayload {
     None,
     /// `java.lang.String` content.
-    JavaString(String),
+    JavaString(JavaStringValue),
     /// Object array (`[Ljava/lang/Object;` etc.).
     Array(Vec<JValue>),
     /// Byte/char/int primitive arrays.
@@ -181,7 +284,21 @@ impl JObject {
         Rc::new(RefCell::new(JObject {
             class_name: "java/lang/String".to_owned(),
             fields: HashMap::new(),
-            native: NativePayload::JavaString(s.into()),
+            native: NativePayload::JavaString(JavaStringValue::new(s)),
+        }))
+    }
+
+    /// Create a `java.lang.String` backed by raw UTF-16 code units.
+    pub fn new_string_utf16(utf16: Vec<u16>) -> JRef {
+        Self::new_string_value(JavaStringValue::from_utf16(utf16))
+    }
+
+    /// Create a `java.lang.String` backed by an existing UTF-16 value.
+    pub fn new_string_value(value: JavaStringValue) -> JRef {
+        Rc::new(RefCell::new(JObject {
+            class_name: "java/lang/String".to_owned(),
+            fields: HashMap::new(),
+            native: NativePayload::JavaString(value),
         }))
     }
 
@@ -224,8 +341,23 @@ impl JObject {
     /// Get the string content if this is a `java.lang.String`.
     pub fn as_java_string(&self) -> Option<&str> {
         match &self.native {
+            NativePayload::JavaString(s) => s.as_str(),
+            _ => None,
+        }
+    }
+
+    pub fn as_java_string_value(&self) -> Option<&JavaStringValue> {
+        match &self.native {
             NativePayload::JavaString(s) => Some(s),
             _ => None,
         }
+    }
+
+    pub fn as_java_string_utf16(&self) -> Option<&[u16]> {
+        self.as_java_string_value().map(JavaStringValue::utf16)
+    }
+
+    pub fn java_string_to_string_lossy(&self) -> Option<String> {
+        self.as_java_string_value().map(JavaStringValue::to_string_lossy)
     }
 }

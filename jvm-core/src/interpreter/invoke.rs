@@ -1,5 +1,5 @@
 
-use crate::heap::{JObject, JRef, JValue, NativePayload};
+use crate::heap::{JavaStringValue, JObject, JRef, JValue, NativePayload};
 
 use super::Vm;
 use super::descriptors::*;
@@ -136,14 +136,21 @@ impl Vm {
                         // args[0] = the record instance
                         let recv = args.into_iter().next().unwrap_or(JValue::Ref(None));
                         if let JValue::Ref(Some(recv_ref)) = recv {
-                            let mut parts = Vec::new();
+                            let mut result = Vec::new();
+                            result.extend(class_simple_name.encode_utf16());
+                            result.push('[' as u16);
                             for ((getter_class, getter_method, getter_desc), comp_name) in getters.iter().zip(component_names.iter()) {
                                 let val = self.invoke_virtual(recv_ref.clone(), getter_class, getter_method, getter_desc, vec![])?;
-                                let s = self.jvalue_to_string(val)?;
-                                parts.push(format!("{comp_name}={s}"));
+                                let value = self.jvalue_to_java_string_value(val)?;
+                                if result.last().copied() != Some('[' as u16) {
+                                    result.extend(", ".encode_utf16());
+                                }
+                                result.extend(comp_name.encode_utf16());
+                                result.push('=' as u16);
+                                result.extend_from_slice(value.utf16());
                             }
-                            let result = format!("{}[{}]", class_simple_name, parts.join(", "));
-                            return Ok(JValue::Ref(Some(JObject::new_string(result))));
+                            result.push(']' as u16);
+                            return Ok(JValue::Ref(Some(JObject::new_string_utf16(result))));
                         }
                         return Ok(JValue::Ref(Some(JObject::new_string(format!("{}[]", class_simple_name)))));
                     }
@@ -293,26 +300,37 @@ impl Vm {
     // Record method helpers
     // ------------------------------------------------------------------
 
-    /// Convert a JValue to its Java string representation, calling toString() for objects.
-    pub(in crate::interpreter) fn jvalue_to_string(&mut self, val: JValue) -> Result<String, String> {
+    /// Convert a JValue to its Java string representation while preserving UTF-16 content.
+    pub(in crate::interpreter) fn jvalue_to_java_string_value(
+        &mut self,
+        val: JValue,
+    ) -> Result<JavaStringValue, String> {
         match val {
-            JValue::Void => Ok("null".to_owned()),
-            JValue::Int(v) => Ok(v.to_string()),
-            JValue::Long(v) => Ok(v.to_string()),
-            JValue::Float(v) => Ok(v.to_string()),
-            JValue::Double(v) => Ok(v.to_string()),
-            JValue::Ref(None) => Ok("null".to_owned()),
+            JValue::Void => Ok(JavaStringValue::new("null")),
+            JValue::Int(v) => Ok(JavaStringValue::new(v.to_string())),
+            JValue::Long(v) => Ok(JavaStringValue::new(v.to_string())),
+            JValue::Float(v) => Ok(JavaStringValue::new(v.to_string())),
+            JValue::Double(v) => Ok(JavaStringValue::new(v.to_string())),
+            JValue::Ref(None) => Ok(JavaStringValue::new("null")),
             JValue::Ref(Some(r)) => {
-                if let Some(s) = r.borrow().as_java_string() {
-                    return Ok(s.to_owned());
+                if let Some(s) = r.borrow().as_java_string_value().cloned() {
+                    return Ok(s);
                 }
                 let class_name = r.borrow().class_name.clone();
                 match self.invoke_virtual(r, &class_name, "toString", "()Ljava/lang/String;", vec![])? {
-                    JValue::Ref(Some(sr)) => Ok(sr.borrow().as_java_string().unwrap_or("").to_owned()),
-                    _ => Ok("null".to_owned()),
+                    JValue::Ref(Some(sr)) => {
+                        let value = {
+                            let sb = sr.borrow();
+                            sb.as_java_string_value()
+                                .cloned()
+                                .or_else(|| sb.java_string_to_string_lossy().map(JavaStringValue::new))
+                        };
+                        Ok(value.unwrap_or_else(|| JavaStringValue::new("null")))
+                    }
+                    _ => Ok(JavaStringValue::new("null")),
                 }
             }
-            JValue::ReturnAddress(_) => Ok("?".to_owned()),
+            JValue::ReturnAddress(_) => Ok(JavaStringValue::new("?")),
         }
     }
 
@@ -326,8 +344,8 @@ impl Vm {
             (JValue::Ref(None), JValue::Ref(None)) => Ok(true),
             (JValue::Ref(Some(ra)), JValue::Ref(Some(rb))) => {
                 // Try string equality first.
-                let sa = ra.borrow().as_java_string().map(|s| s.to_owned());
-                let sb = rb.borrow().as_java_string().map(|s| s.to_owned());
+                let sa = ra.borrow().as_java_string_value().cloned();
+                let sb = rb.borrow().as_java_string_value().cloned();
                 if let (Some(sa), Some(sb)) = (sa, sb) {
                     return Ok(sa == sb);
                 }
@@ -348,12 +366,8 @@ impl Vm {
             JValue::Double(v) => Ok((v.to_bits() ^ (v.to_bits() >> 32)) as i32),
             JValue::Ref(None) => Ok(0),
             JValue::Ref(Some(r)) => {
-                if let Some(s) = r.borrow().as_java_string() {
-                    let mut h: i32 = 0;
-                    for b in s.bytes() {
-                        h = h.wrapping_mul(31).wrapping_add(b as i32);
-                    }
-                    return Ok(h);
+                if let Some(s) = r.borrow().as_java_string_value() {
+                    return Ok(s.hash_code());
                 }
                 let class_name = r.borrow().class_name.clone();
                 match self.invoke_virtual(r.clone(), &class_name, "hashCode", "()I", vec![])? {
@@ -416,5 +430,47 @@ impl Vm {
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jvalue_hash_uses_utf16_code_units_for_strings() {
+        let mut vm = Vm::new();
+        let emoji = JValue::Ref(Some(JObject::new_string("😀")));
+        let high_surrogate = JValue::Ref(Some(JObject::new_string_utf16(vec![0xD83D])));
+
+        assert_eq!(vm.jvalue_hash(&emoji).expect("emoji hash"), 1_772_899);
+        assert_eq!(
+            vm.jvalue_hash(&high_surrogate).expect("surrogate hash"),
+            55_357,
+        );
+    }
+
+    #[test]
+    fn jvalue_equals_compares_utf16_backed_strings() {
+        let mut vm = Vm::new();
+        let left = JValue::Ref(Some(JObject::new_string_utf16(vec![0xD83D])));
+        let same = JValue::Ref(Some(JObject::new_string_utf16(vec![0xD83D])));
+        let different = JValue::Ref(Some(JObject::new_string_utf16(vec![0xDE00])));
+
+        assert!(vm.jvalue_equals(&left, &same).expect("same surrogate"));
+        assert!(!vm
+            .jvalue_equals(&left, &different)
+            .expect("different surrogate"));
+    }
+
+    #[test]
+    fn jvalue_to_java_string_value_preserves_surrogate_halves() {
+        let mut vm = Vm::new();
+        let high_surrogate = JValue::Ref(Some(JObject::new_string_utf16(vec![0xD83D])));
+
+        let rendered = vm
+            .jvalue_to_java_string_value(high_surrogate)
+            .expect("string value");
+        assert_eq!(rendered.utf16(), &[0xD83D]);
     }
 }

@@ -3,39 +3,167 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::class_file::Attribute;
-use crate::heap::{JObject, JRef, JValue, NativePayload};
+use crate::heap::{JavaStringValue, JObject, JRef, JValue, NativePayload};
 
 use super::LazyClass;
 use super::descriptors::*;
+use super::native_static::regex_encode_java_string;
 
 #[cfg(target_arch = "wasm32")]
 use super::{console_error, console_log};
 
-/// Convert a Java char-index to a UTF-8 byte offset within `s`.
-/// Returns `s.len()` when `char_idx` is beyond the end of the string.
-fn char_to_byte_offset(s: &str, char_idx: usize) -> usize {
-    if char_idx == 0 {
+/// Convert a UTF-16 code unit index to a UTF-8 byte offset within `s`.
+///
+/// When the index lands inside a surrogate pair, round up to the next scalar
+/// boundary so repeated regex searches can keep making progress.
+fn utf16_index_to_byte_offset(s: &str, utf16_idx: usize) -> usize {
+    if utf16_idx == 0 {
         return 0;
     }
-    s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
+    let mut byte_offset = 0usize;
+    let mut code_units = 0usize;
+    for ch in s.chars() {
+        byte_offset += ch.len_utf8();
+        code_units += ch.len_utf16();
+        if code_units >= utf16_idx {
+            return byte_offset;
+        }
+    }
+    s.len()
+}
+
+/// Convert a UTF-16 code unit index to a UTF-8 byte offset only when it lands
+/// on an exact scalar boundary. Returns `None` for indices inside surrogate
+/// pairs, where Rust `str` cannot slice losslessly.
+fn utf16_index_to_byte_offset_exact(s: &str, utf16_idx: usize) -> Option<usize> {
+    let mut byte_offset = 0usize;
+    let mut code_units = 0usize;
+    if utf16_idx == 0 {
+        return Some(0);
+    }
+    for ch in s.chars() {
+        if code_units == utf16_idx {
+            return Some(byte_offset);
+        }
+        let next_code_units = code_units + ch.len_utf16();
+        if utf16_idx < next_code_units {
+            return None;
+        }
+        code_units = next_code_units;
+        byte_offset += ch.len_utf8();
+    }
+    (code_units == utf16_idx).then_some(byte_offset)
+}
+
+/// Convert a UTF-8 byte offset to a UTF-16 code unit index.
+fn byte_offset_to_utf16_index(s: &str, byte_offset: usize) -> usize {
+    let mut utf16_idx = 0usize;
+    let mut bytes_seen = 0usize;
+    for ch in s.chars() {
+        if bytes_seen >= byte_offset {
+            break;
+        }
+        bytes_seen += ch.len_utf8();
+        utf16_idx += ch.len_utf16();
+    }
+    utf16_idx
+}
+
+fn arg_string_value(arg: &JValue) -> Option<JavaStringValue> {
+    match arg {
+        JValue::Ref(Some(r)) => r.borrow().as_java_string_value().cloned(),
+        _ => None,
+    }
+}
+
+fn u16_find(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
+    let from = from.min(haystack.len());
+    if needle.is_empty() {
+        return Some(from);
+    }
+    if needle.len() > haystack.len() || from > haystack.len().saturating_sub(needle.len()) {
+        return None;
+    }
+    let max = haystack.len() - needle.len();
+    (from..=max).find(|&i| &haystack[i..i + needle.len()] == needle)
+}
+
+fn u16_last_index_of_unit(haystack: &[u16], needle: u16, from: usize) -> Option<usize> {
+    if haystack.is_empty() {
+        return None;
+    }
+    let start = from.min(haystack.len().saturating_sub(1));
+    (0..=start).rev().find(|&i| haystack[i] == needle)
+}
+
+fn u16_rfind(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(from.min(haystack.len()));
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    let start = from.min(haystack.len() - needle.len());
+    (0..=start)
+        .rev()
+        .find(|&i| &haystack[i..i + needle.len()] == needle)
+}
+
+fn u16_replace(haystack: &[u16], needle: &[u16], replacement: &[u16]) -> Vec<u16> {
+    if needle.is_empty() {
+        return haystack.to_vec();
+    }
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut cursor = 0usize;
+    while cursor <= haystack.len().saturating_sub(needle.len()) {
+        if &haystack[cursor..cursor + needle.len()] == needle {
+            out.extend_from_slice(replacement);
+            cursor += needle.len();
+        } else {
+            out.push(haystack[cursor]);
+            cursor += 1;
+        }
+    }
+    out.extend_from_slice(&haystack[cursor..]);
+    out
+}
+
+fn string_slice_value(value: &JavaStringValue, start: usize, end: usize) -> JavaStringValue {
+    if let Some(text) = value.as_str() {
+        if let (Some(start_byte), Some(end_byte)) = (
+            utf16_index_to_byte_offset_exact(text, start),
+            utf16_index_to_byte_offset_exact(text, end),
+        ) {
+            return JavaStringValue::new(text[start_byte..end_byte].to_owned());
+        }
+    }
+    JavaStringValue::from_utf16(value.slice_utf16(start, end))
+}
+
+fn string_index_of_value(haystack: &JavaStringValue, needle: &JavaStringValue, from_index: usize) -> Option<usize> {
+    if let (Some(hs), Some(ns)) = (haystack.as_str(), needle.as_str()) {
+        let start_byte = utf16_index_to_byte_offset(hs, from_index);
+        return hs[start_byte..]
+            .find(ns)
+            .map(|byte_idx| byte_offset_to_utf16_index(hs, start_byte + byte_idx));
+    }
+    u16_find(haystack.utf16(), needle.utf16(), from_index)
 }
 
 impl super::Vm {
-    /// Extract a Rust `String` from `java/lang/String` constructor arguments based on the method descriptor.
-    /// Returns an empty string if the descriptor is not recognized or arguments are invalid.
-    pub(super) fn string_from_init_args(&self, descriptor: &str, args: &[JValue], _this: &JRef) -> String {
+    /// Extract UTF-16-backed string content from `java/lang/String` constructor arguments.
+    pub(super) fn string_from_init_args(&self, descriptor: &str, args: &[JValue], _this: &JRef) -> JavaStringValue {
         match descriptor {
-            "()V" => String::new(),
+            "()V" => JavaStringValue::from_utf16(Vec::new()),
             "([C)V" => {
                 // String(char[])
                 if let Some(r) = args.first().and_then(|a| a.as_ref()) {
                     if let NativePayload::Array(chars) = &r.borrow().native {
-                        chars.iter().map(|v| {
-                            let code = v.as_int() as u32;
-                            char::from_u32(code).unwrap_or('?')
-                        }).collect()
-                    } else { String::new() }
-                } else { String::new() }
+                        JavaStringValue::from_utf16(
+                            chars.iter().map(|v| v.as_int() as u16).collect(),
+                        )
+                    } else { JavaStringValue::from_utf16(Vec::new()) }
+                } else { JavaStringValue::from_utf16(Vec::new()) }
             }
             "([CII)V" => {
                 // String(char[], offset, count)
@@ -44,22 +172,24 @@ impl super::Vm {
                     let count = args.get(2).map(|a| a.as_int().max(0) as usize).unwrap_or(0);
                     if let NativePayload::Array(chars) = &r.borrow().native {
                         let end = offset.saturating_add(count).min(chars.len());
-                        chars[offset.min(chars.len())..end].iter()
-                            .map(|v| {
-                                let code = v.as_int() as u32;
-                                char::from_u32(code).unwrap_or('?')
-                            })
-                            .collect()
-                    } else { String::new() }
-                } else { String::new() }
+                        JavaStringValue::from_utf16(
+                            chars[offset.min(chars.len())..end]
+                                .iter()
+                                .map(|v| v.as_int() as u16)
+                                .collect(),
+                        )
+                    } else { JavaStringValue::from_utf16(Vec::new()) }
+                } else { JavaStringValue::from_utf16(Vec::new()) }
             }
             "([B)V" => {
                 // String(byte[])
                 if let Some(r) = args.first().and_then(|a| a.as_ref()) {
                     if let NativePayload::Array(bytes) = &r.borrow().native {
-                        bytes.iter().map(|v| v.as_int() as u8 as char).collect()
-                    } else { String::new() }
-                } else { String::new() }
+                        JavaStringValue::from_utf16(
+                            bytes.iter().map(|v| v.as_int() as u8 as u16).collect(),
+                        )
+                    } else { JavaStringValue::from_utf16(Vec::new()) }
+                } else { JavaStringValue::from_utf16(Vec::new()) }
             }
             "([BII)V" | "([BIILjava/lang/String;)V" | "([BIILjava/nio/charset/Charset;)V" => {
                 if let Some(r) = args.first().and_then(|a| a.as_ref()) {
@@ -67,19 +197,23 @@ impl super::Vm {
                     let count = args.get(2).map(|a| a.as_int().max(0) as usize).unwrap_or(0);
                     if let NativePayload::Array(bytes) = &r.borrow().native {
                         let end = offset.saturating_add(count).min(bytes.len());
-                        bytes[offset.min(bytes.len())..end]
-                            .iter()
-                            .map(|v| v.as_int() as u8 as char)
-                            .collect()
-                    } else { String::new() }
-                } else { String::new() }
+                        JavaStringValue::from_utf16(
+                            bytes[offset.min(bytes.len())..end]
+                                .iter()
+                                .map(|v| v.as_int() as u8 as u16)
+                                .collect(),
+                        )
+                    } else { JavaStringValue::from_utf16(Vec::new()) }
+                } else { JavaStringValue::from_utf16(Vec::new()) }
             }
             "([BLjava/lang/String;)V" | "([BLjava/nio/charset/Charset;)V" => {
                 if let Some(r) = args.first().and_then(|a| a.as_ref()) {
                     if let NativePayload::Array(bytes) = &r.borrow().native {
-                        bytes.iter().map(|v| v.as_int() as u8 as char).collect()
-                    } else { String::new() }
-                } else { String::new() }
+                        JavaStringValue::from_utf16(
+                            bytes.iter().map(|v| v.as_int() as u8 as u16).collect(),
+                        )
+                    } else { JavaStringValue::from_utf16(Vec::new()) }
+                } else { JavaStringValue::from_utf16(Vec::new()) }
             }
             "([BIII)V" => {
                 if let Some(r) = args.first().and_then(|a| a.as_ref()) {
@@ -88,20 +222,25 @@ impl super::Vm {
                     let count = args.get(3).map(|a| a.as_int().max(0) as usize).unwrap_or(0);
                     if let NativePayload::Array(bytes) = &r.borrow().native {
                         let end = offset.saturating_add(count).min(bytes.len());
-                        bytes[offset.min(bytes.len())..end]
-                            .iter()
-                            .map(|v| v.as_int() as u8 as char)
-                            .collect()
-                    } else { String::new() }
-                } else { String::new() }
+                        JavaStringValue::from_utf16(
+                            bytes[offset.min(bytes.len())..end]
+                                .iter()
+                                .map(|v| v.as_int() as u8 as u16)
+                                .collect(),
+                        )
+                    } else { JavaStringValue::from_utf16(Vec::new()) }
+                } else { JavaStringValue::from_utf16(Vec::new()) }
             }
             "(Ljava/lang/String;)V" => {
                 // String(String) — copy constructor
                 if let Some(r) = args.first().and_then(|a| a.as_ref()) {
-                    r.borrow().as_java_string().unwrap_or("").to_owned()
-                } else { String::new() }
+                    r.borrow()
+                        .as_java_string_value()
+                        .cloned()
+                        .unwrap_or_else(|| JavaStringValue::from_utf16(Vec::new()))
+                } else { JavaStringValue::from_utf16(Vec::new()) }
             }
-            _ => String::new(),
+            _ => JavaStringValue::from_utf16(Vec::new()),
         }
     }
 
@@ -369,17 +508,15 @@ impl super::Vm {
         // java/lang/Object instance methods are inherited by all reference types.
         match method_name {
             "hashCode" if _descriptor == "()I" => {
-                // Strings have value-based equality: use Java's string hash algorithm.
-                if let Some(s) = this.borrow().as_java_string().map(|s| s.to_owned()) {
-                    let hash = s.chars().fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(c as i32));
-                    return Some(JValue::Int(hash));
+                if let Some(s) = this.borrow().as_java_string_value() {
+                    return Some(JValue::Int(s.hash_code()));
                 }
                 // For all other objects use identity (pointer address).
                 let ptr = Rc::as_ptr(this) as usize;
                 return Some(JValue::Int((ptr as u64 as u32) as i32));
             }
-            "intern" if _descriptor == "()Ljava/lang/String;" && this.borrow().as_java_string().is_some() => {
-                return Some(JValue::Ref(Some(this.clone())));
+            "intern" if _descriptor == "()Ljava/lang/String;" && this.borrow().as_java_string_value().is_some() => {
+                return Some(JValue::Ref(self.intern_existing_string_ref(this)));
             }
             "getClass" if _descriptor == "()Ljava/lang/Class;" => {
                 let runtime_class = this.borrow().class_name.clone();
@@ -526,15 +663,15 @@ impl super::Vm {
                 let input = _args
                     .first()
                     .and_then(|v| v.as_ref())
-                    .and_then(|r| r.borrow().as_java_string().map(|s| s.to_owned()))
-                    .unwrap_or_default();
+                    .cloned()
+                    .unwrap_or_else(|| self.intern_string(""));
                 let m = JObject::new("java/util/regex/Matcher");
                 m.borrow_mut().fields.insert("__pattern".to_owned(), JValue::Ref(Some(this.clone())));
-                m.borrow_mut().fields.insert("__input".to_owned(), JValue::Ref(Some(self.intern_string(input))));
+                m.borrow_mut().fields.insert("__input".to_owned(), JValue::Ref(Some(input)));
                 Some(JValue::Ref(Some(m)))
             }
             ("java/util/regex/Matcher", "matches") => {
-                let (regex, input) = {
+                let (regex, input_value) = {
                     let mb = this.borrow();
                     // Try bytecode field names first, then native field names
                     let pattern_ref = mb.fields.get("pattern")
@@ -547,33 +684,47 @@ impl super::Vm {
                             pb.fields.get("regex")
                                 .or_else(|| pb.fields.get("__regex"))
                                 .and_then(|v| v.as_ref().cloned())
-                                .and_then(|s| s.borrow().as_java_string().map(|x| x.to_owned()))
+                                .and_then(|s| s.borrow().as_java_string_value().cloned())
+                                .map(|s| regex_encode_java_string(&s).into_owned())
                         })
                         .unwrap_or_default();
                     let input = mb.fields.get("input")
                         .or_else(|| mb.fields.get("__input"))
                         .and_then(|v| v.as_ref())
-                        .and_then(|s| s.borrow().as_java_string().map(|x| x.to_owned()))
-                        .unwrap_or_default();
+                        .and_then(|s| s.borrow().as_java_string_value().cloned())
+                        .unwrap_or_else(|| JavaStringValue::from_utf16(Vec::new()));
                     (regex, input)
                 };
+                let input_text = regex_encode_java_string(&input_value);
                 // Use captures to extract groups
                 let anchored = format!("^(?:{regex})$");
                 let re = regex::Regex::new(&anchored).ok();
-                let caps = re.as_ref().and_then(|r| r.captures(&input));
+                let caps = re.as_ref().and_then(|r| r.captures(input_text.as_ref()));
                 let ok = caps.is_some();
                 // Store captured groups in __groups array field + matchStart/matchEnd
                 if let Some(caps) = &caps {
                     let mut groups = Vec::new();
                     for i in 0..caps.len() {
                         if let Some(m) = caps.get(i) {
-                            groups.push(JValue::Ref(Some(self.intern_string(m.as_str()))));
+                            let start = byte_offset_to_utf16_index(&input_text, m.start());
+                            let end = byte_offset_to_utf16_index(input_text.as_ref(), m.end());
+                            groups.push(JValue::Ref(Some(self.intern_string_value(
+                                string_slice_value(&input_value, start, end),
+                            ))));
                         } else {
                             groups.push(JValue::Ref(None));
                         }
                     }
                     let groups_arr = JObject::new_array("[Ljava/lang/String;", groups);
-                    let (ms, me) = caps.get(0).map(|m| (m.start() as i32, m.end() as i32)).unwrap_or((-1, -1));
+                    let (ms, me) = caps
+                        .get(0)
+                        .map(|m| {
+                            (
+                                byte_offset_to_utf16_index(input_text.as_ref(), m.start()) as i32,
+                                byte_offset_to_utf16_index(input_text.as_ref(), m.end()) as i32,
+                            )
+                        })
+                        .unwrap_or((-1, -1));
                     this.borrow_mut().fields.insert("__groups".to_owned(), JValue::Ref(Some(groups_arr)));
                     this.borrow_mut().fields.insert("matchStart".to_owned(), JValue::Int(ms));
                     this.borrow_mut().fields.insert("matchEnd".to_owned(), JValue::Int(me));
@@ -585,7 +736,7 @@ impl super::Vm {
                 Some(JValue::Int(if ok { 1 } else { 0 }))
             }
             ("java/util/regex/Matcher", "find") => {
-                let (regex, input, search_index) = {
+                let (regex, input_value, search_index) = {
                     let mb = this.borrow();
                     let pattern_ref = mb
                         .fields
@@ -599,7 +750,8 @@ impl super::Vm {
                                 .get("regex")
                                 .or_else(|| pb.fields.get("__regex"))
                                 .and_then(|v| v.as_ref().cloned())
-                                .and_then(|s| s.borrow().as_java_string().map(|x| x.to_owned()))
+                                .and_then(|s| s.borrow().as_java_string_value().cloned())
+                                .map(|s| regex_encode_java_string(&s).into_owned())
                         })
                         .unwrap_or_default();
                     let input = mb
@@ -607,8 +759,8 @@ impl super::Vm {
                         .get("input")
                         .or_else(|| mb.fields.get("__input"))
                         .and_then(|v| v.as_ref())
-                        .and_then(|s| s.borrow().as_java_string().map(|x| x.to_owned()))
-                        .unwrap_or_default();
+                        .and_then(|s| s.borrow().as_java_string_value().cloned())
+                        .unwrap_or_else(|| JavaStringValue::from_utf16(Vec::new()));
                     let search_index = mb
                         .fields
                         .get("searchIndex")
@@ -616,8 +768,40 @@ impl super::Vm {
                         .unwrap_or(0);
                     (regex, input, search_index)
                 };
+                let input_len = input_value.len_utf16();
 
-                if search_index > input.len() {
+                if regex.is_empty() {
+                    if search_index > input_len {
+                        let mut mb = this.borrow_mut();
+                        mb.fields.remove("__groups");
+                        mb.fields.insert("matchStart".to_owned(), JValue::Int(-1));
+                        mb.fields.insert("matchEnd".to_owned(), JValue::Int(-1));
+                        mb.fields.insert(
+                            "searchIndex".to_owned(),
+                            JValue::Int(input_len.saturating_add(1) as i32),
+                        );
+                        return Some(JValue::Int(0));
+                    }
+                    let groups_arr = JObject::new_array(
+                        "[Ljava/lang/String;",
+                        vec![JValue::Ref(Some(self.intern_string("")))],
+                    );
+                    let next_search = search_index.saturating_add(1);
+                    let mut mb = this.borrow_mut();
+                    mb.fields
+                        .insert("__groups".to_owned(), JValue::Ref(Some(groups_arr)));
+                    mb.fields
+                        .insert("matchStart".to_owned(), JValue::Int(search_index as i32));
+                    mb.fields
+                        .insert("matchEnd".to_owned(), JValue::Int(search_index as i32));
+                    mb.fields.insert(
+                        "searchIndex".to_owned(),
+                        JValue::Int(next_search.min(input_len.saturating_add(1)) as i32),
+                    );
+                    return Some(JValue::Int(1));
+                }
+
+                if search_index > input_len {
                     this.borrow_mut().fields.remove("__groups");
                     this.borrow_mut()
                         .fields
@@ -625,18 +809,28 @@ impl super::Vm {
                     this.borrow_mut()
                         .fields
                         .insert("matchEnd".to_owned(), JValue::Int(-1));
+                    this.borrow_mut().fields.insert(
+                        "searchIndex".to_owned(),
+                        JValue::Int(input_len.saturating_add(1) as i32),
+                    );
                     return Some(JValue::Int(0));
                 }
 
+                let input_text = regex_encode_java_string(&input_value);
                 let re = regex::Regex::new(&regex).ok();
-                let hay = &input[search_index..];
+                let start_byte = utf16_index_to_byte_offset(input_text.as_ref(), search_index);
+                let hay = &input_text.as_ref()[start_byte..];
                 let caps = re.as_ref().and_then(|r| r.captures(hay));
 
                 if let Some(caps) = caps {
                     let mut groups = Vec::new();
                     for i in 0..caps.len() {
                         if let Some(m) = caps.get(i) {
-                            groups.push(JValue::Ref(Some(self.intern_string(m.as_str()))));
+                            let start = byte_offset_to_utf16_index(input_text.as_ref(), start_byte + m.start());
+                            let end = byte_offset_to_utf16_index(input_text.as_ref(), start_byte + m.end());
+                            groups.push(JValue::Ref(Some(self.intern_string_value(
+                                string_slice_value(&input_value, start, end),
+                            ))));
                         } else {
                             groups.push(JValue::Ref(None));
                         }
@@ -646,8 +840,8 @@ impl super::Vm {
                         .get(0)
                         .map(|m| {
                             (
-                                (search_index + m.start()) as i32,
-                                (search_index + m.end()) as i32,
+                                byte_offset_to_utf16_index(input_text.as_ref(), start_byte + m.start()) as i32,
+                                byte_offset_to_utf16_index(input_text.as_ref(), start_byte + m.end()) as i32,
                             )
                         })
                         .unwrap_or((-1, -1));
@@ -663,7 +857,7 @@ impl super::Vm {
                     mb.fields.insert("matchEnd".to_owned(), JValue::Int(me));
                     mb.fields.insert(
                         "searchIndex".to_owned(),
-                        JValue::Int(next_search.min(input.len().saturating_add(1)) as i32),
+                        JValue::Int(next_search.min(input_len.saturating_add(1)) as i32),
                     );
                     return Some(JValue::Int(1));
                 }
@@ -674,7 +868,7 @@ impl super::Vm {
                 mb.fields.insert("matchEnd".to_owned(), JValue::Int(-1));
                 mb.fields.insert(
                     "searchIndex".to_owned(),
-                    JValue::Int(input.len().saturating_add(1) as i32),
+                    JValue::Int(input_len.saturating_add(1) as i32),
                 );
                 Some(JValue::Int(0))
             }
@@ -696,11 +890,13 @@ impl super::Vm {
                     let input = mb.fields.get("input")
                         .or_else(|| mb.fields.get("__input"))
                         .and_then(|v| v.as_ref())
-                        .and_then(|s| s.borrow().as_java_string().map(|x| x.to_owned()))
-                        .unwrap_or_default();
+                        .and_then(|s| s.borrow().as_java_string_value().cloned())
+                        .unwrap_or_else(|| JavaStringValue::from_utf16(Vec::new()));
                     drop(mb);
-                    if start >= 0 && end >= 0 && (end as usize) <= input.len() {
-                        return Some(JValue::Ref(Some(self.intern_string(&input[start as usize..end as usize]))));
+                    if start >= 0 && end >= 0 && (end as usize) <= input.len_utf16() {
+                        return Some(JValue::Ref(Some(JObject::new_string_value(
+                            string_slice_value(&input, start as usize, end as usize),
+                        ))));
                     }
                 } else {
                     drop(mb);
@@ -1429,161 +1625,271 @@ impl super::Vm {
             }
             // String native methods — backed by NativePayload::JavaString in Rust.
             ("java/lang/String", "toString") => {
-                let s = this.borrow().as_java_string().unwrap_or("").to_owned();
-                Some(JValue::Ref(Some(JObject::new_string(s))))
+                Some(JValue::Ref(Some(Rc::clone(this))))
             }
             ("java/lang/String", "length") => {
-                let len = this.borrow().as_java_string().map(|s| s.chars().count() as i32).unwrap_or(0);
+                let len = this
+                    .borrow()
+                    .as_java_string_value()
+                    .map(|s| s.len_utf16() as i32)
+                    .unwrap_or(0);
                 Some(JValue::Int(len))
             }
             ("java/lang/String", "charAt") => {
                 let idx = _args.first().map(|v| v.as_int() as usize).unwrap_or(0);
-                let ch = this.borrow().as_java_string()
-                    .and_then(|s| s.chars().nth(idx))
-                    .unwrap_or('\0') as i32;
+                let ch = this
+                    .borrow()
+                    .as_java_string_value()
+                    .and_then(|s| s.code_unit_at(idx))
+                    .unwrap_or(0) as i32;
                 Some(JValue::Int(ch))
             }
             ("java/lang/String", "isEmpty") => {
-                let empty = this.borrow().as_java_string().map(|s| s.is_empty()).unwrap_or(true);
+                let empty = this
+                    .borrow()
+                    .as_java_string_value()
+                    .map(|s| s.len_utf16() == 0)
+                    .unwrap_or(true);
                 Some(JValue::Int(if empty { 1 } else { 0 }))
             }
             ("java/lang/String", "equals") => {
-                let other_str = _args.first()
-                    .and_then(|a| a.as_ref())
-                    .and_then(|r| r.borrow().as_java_string().map(|s| s.to_owned()));
-                let this_str = this.borrow().as_java_string().map(|s| s.to_owned());
-                let eq = match (this_str, other_str) {
-                    (Some(a), Some(b)) => a == b,
-                    _ => false,
-                };
+                let this_borrow = this.borrow();
+                let eq = this_borrow
+                    .as_java_string_value()
+                    .map(|this_value| {
+                        _args
+                            .first()
+                            .and_then(|arg| match arg {
+                                JValue::Ref(Some(other_ref)) => Some(other_ref),
+                                _ => None,
+                            })
+                            .map(|other_ref| {
+                                let other_borrow = other_ref.borrow();
+                                other_borrow
+                                    .as_java_string_value()
+                                    .map(|other_value| this_value == other_value)
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
                 Some(JValue::Int(if eq { 1 } else { 0 }))
             }
             ("java/lang/String", "hashCode") => {
-                let hash = this.borrow().as_java_string().map(|s| {
-                    s.chars().fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(c as i32))
-                }).unwrap_or(0);
+                let hash = this
+                    .borrow()
+                    .as_java_string_value()
+                    .map(JavaStringValue::hash_code)
+                    .unwrap_or(0);
                 Some(JValue::Int(hash))
             }
             ("java/lang/String", "substring") => {
-                let s = this.borrow().as_java_string().unwrap_or("").to_owned();
-                let char_len = s.chars().count();
-                let begin = (_args.first().map(|v| v.as_int() as usize).unwrap_or(0)).min(char_len);
-                let end = (_args.get(1).map(|v| v.as_int() as usize).unwrap_or(char_len)).min(char_len).max(begin);
-                let sub: String = s.chars().skip(begin).take(end - begin).collect();
-                Some(JValue::Ref(Some(JObject::new_string(sub))))
+                let this_borrow = this.borrow();
+                let value = this_borrow.as_java_string_value();
+                let len = value.map(JavaStringValue::len_utf16).unwrap_or(0);
+                let begin = (_args.first().map(|v| v.as_int() as usize).unwrap_or(0)).min(len);
+                let end = (_args.get(1).map(|v| v.as_int() as usize).unwrap_or(len))
+                    .min(len)
+                    .max(begin);
+                let result = value
+                    .map(|value| string_slice_value(value, begin, end))
+                    .unwrap_or_else(|| JavaStringValue::from_utf16(Vec::new()));
+                Some(JValue::Ref(Some(JObject::new_string_value(result))))
             }
             ("java/lang/String", "concat") => {
-                let a = this.borrow().as_java_string().unwrap_or("").to_owned();
-                let b = _args.first()
-                    .and_then(|v| v.as_ref())
-                    .and_then(|r| r.borrow().as_java_string().map(|s| s.to_owned()))
-                    .unwrap_or_default();
-                Some(JValue::Ref(Some(JObject::new_string(a + &b))))
+                let this_borrow = this.borrow();
+                let result = if let Some(left) = this_borrow.as_java_string_value() {
+                    if let Some(arg_ref) = _args.first().and_then(|arg| arg.as_ref()) {
+                        let arg_borrow = arg_ref.borrow();
+                        if let Some(right) = arg_borrow.as_java_string_value() {
+                            left.concat(right)
+                        } else {
+                            left.clone()
+                        }
+                    } else {
+                        left.clone()
+                    }
+                } else {
+                    JavaStringValue::from_utf16(Vec::new())
+                };
+                Some(JValue::Ref(Some(JObject::new_string_value(result))))
             }
             ("java/lang/String", "contains") => {
-                let haystack = this.borrow().as_java_string().unwrap_or("").to_owned();
-                let needle = _args.first()
-                    .and_then(|v| v.as_ref())
-                    .and_then(|r| r.borrow().as_java_string().map(|s| s.to_owned()))
-                    .unwrap_or_default();
-                Some(JValue::Int(if haystack.contains(&needle) { 1 } else { 0 }))
+                let this_borrow = this.borrow();
+                let found = this_borrow
+                    .as_java_string_value()
+                    .map(|haystack| {
+                        _args
+                            .first()
+                            .and_then(|arg| match arg {
+                                JValue::Ref(Some(needle_ref)) => Some(needle_ref),
+                                _ => None,
+                            })
+                            .map(|needle_ref| {
+                                let needle_borrow = needle_ref.borrow();
+                                needle_borrow
+                                    .as_java_string_value()
+                                    .map(|needle| string_index_of_value(haystack, needle, 0).is_some())
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                Some(JValue::Int(if found { 1 } else { 0 }))
             }
             ("java/lang/String", "startsWith") => {
-                let s = this.borrow().as_java_string().unwrap_or("").to_owned();
-                let prefix = _args.first()
-                    .and_then(|v| v.as_ref())
-                    .and_then(|r| r.borrow().as_java_string().map(|s| s.to_owned()))
-                    .unwrap_or_default();
-                Some(JValue::Int(if s.starts_with(&prefix) { 1 } else { 0 }))
+                let this_borrow = this.borrow();
+                let s = this_borrow.as_java_string_utf16().unwrap_or(&[]);
+                let prefix = _args
+                    .first()
+                    .and_then(arg_string_value);
+                let ok = if let Some(prefix) = prefix {
+                    s.len() >= prefix.len_utf16() && s[..prefix.len_utf16()] == prefix.utf16()[..]
+                } else {
+                    false
+                };
+                Some(JValue::Int(if ok { 1 } else { 0 }))
             }
             ("java/lang/String", "endsWith") => {
-                let s = this.borrow().as_java_string().unwrap_or("").to_owned();
-                let suffix = _args.first()
-                    .and_then(|v| v.as_ref())
-                    .and_then(|r| r.borrow().as_java_string().map(|s| s.to_owned()))
-                    .unwrap_or_default();
-                Some(JValue::Int(if s.ends_with(&suffix) { 1 } else { 0 }))
+                let this_borrow = this.borrow();
+                let s = this_borrow.as_java_string_utf16().unwrap_or(&[]);
+                let suffix = _args
+                    .first()
+                    .and_then(arg_string_value);
+                let ok = if let Some(suffix) = suffix {
+                    s.len() >= suffix.len_utf16()
+                        && s[s.len() - suffix.len_utf16()..] == suffix.utf16()[..]
+                } else {
+                    false
+                };
+                Some(JValue::Int(if ok { 1 } else { 0 }))
             }
             ("java/lang/String", "indexOf") => {
-                let s = this.borrow().as_java_string().unwrap_or("").to_owned();
-                // fromIndex (char-index): default 0
-                let from_char = _args.get(1).map(|v| v.as_int().max(0) as usize).unwrap_or(0);
-                let from_byte = char_to_byte_offset(&s, from_char);
-                let search_str = &s[from_byte..];
+                let this_borrow = this.borrow();
+                let value = this_borrow.as_java_string_value();
+                let from_index = _args
+                    .get(1)
+                    .map(|v| v.as_int().max(0) as usize)
+                    .unwrap_or(0);
                 let idx = match _args.first() {
-                    Some(JValue::Ref(Some(r))) => {
-                        let needle = r.borrow().as_java_string().unwrap_or("").to_owned();
-                        search_str.find(needle.as_str()).map(|byte_pos| {
-                            s[..from_byte + byte_pos].chars().count() as i32
-                        }).unwrap_or(-1)
+                    Some(arg) => {
+                        match arg {
+                            JValue::Ref(Some(needle_ref)) => {
+                                let needle_borrow = needle_ref.borrow();
+                                if let (Some(haystack), Some(needle)) =
+                                    (value, needle_borrow.as_java_string_value())
+                                {
+                                    string_index_of_value(haystack, needle, from_index)
+                                        .map(|i| i as i32)
+                                        .unwrap_or(-1)
+                                } else {
+                                    -1
+                                }
+                            }
+                            JValue::Int(ch) => {
+                                let needle = *ch as u16;
+                                let units = value.map(JavaStringValue::utf16).unwrap_or(&[]);
+                                (from_index.min(units.len())..units.len())
+                                    .find(|&i| units[i] == needle)
+                                    .map(|i| i as i32)
+                                    .unwrap_or(-1)
+                            }
+                            _ => -1,
+                        }
                     }
-                    Some(JValue::Int(ch)) => {
-                        let c = char::from_u32(*ch as u32).unwrap_or('\0');
-                        search_str.find(c).map(|byte_pos| {
-                            s[..from_byte + byte_pos].chars().count() as i32
-                        }).unwrap_or(-1)
-                    }
-                    _ => -1,
+                    None => -1,
                 };
                 Some(JValue::Int(idx))
             }
             ("java/lang/String", "lastIndexOf") => {
-                let s = this.borrow().as_java_string().unwrap_or("").to_owned();
-                // fromIndex (char-index): default = end of string.
-                // JDK semantics: search backwards starting AT fromIndex (inclusive),
-                // so slice up to the byte offset of fromIndex+1.
-                let char_len = s.chars().count();
-                let from_char = _args.get(1).map(|v| (v.as_int() as usize).min(char_len)).unwrap_or(char_len);
-                let from_byte = char_to_byte_offset(&s, from_char.saturating_add(1).min(char_len));
-                let search_str = &s[..from_byte];
+                let this_borrow = this.borrow();
+                let value = this_borrow.as_java_string_value();
+                let units = value.map(JavaStringValue::utf16).unwrap_or(&[]);
+                let from_index = _args
+                    .get(1)
+                    .map(|v| v.as_int().max(0) as usize)
+                    .unwrap_or_else(|| units.len().saturating_sub(1));
                 let idx = match _args.first() {
-                    Some(JValue::Ref(Some(r))) => {
-                        let needle = r.borrow().as_java_string().unwrap_or("").to_owned();
-                        search_str.rfind(needle.as_str()).map(|byte_pos| {
-                            s[..byte_pos].chars().count() as i32
-                        }).unwrap_or(-1)
+                    Some(arg) => {
+                        match arg {
+                            JValue::Ref(Some(needle_ref)) => {
+                                let needle_borrow = needle_ref.borrow();
+                                if let Some(needle) = needle_borrow.as_java_string_value() {
+                                    u16_rfind(units, needle.utf16(), from_index)
+                                        .map(|i| i as i32)
+                                        .unwrap_or(-1)
+                                } else {
+                                    -1
+                                }
+                            }
+                            JValue::Int(ch) => {
+                                u16_last_index_of_unit(units, *ch as u16, from_index)
+                                    .map(|i| i as i32)
+                                    .unwrap_or(-1)
+                            }
+                            _ => -1,
+                        }
                     }
-                    Some(JValue::Int(ch)) => {
-                        let c = char::from_u32(*ch as u32).unwrap_or('\0');
-                        search_str.rfind(c).map(|byte_pos| {
-                            s[..byte_pos].chars().count() as i32
-                        }).unwrap_or(-1)
-                    }
-                    _ => -1,
+                    None => -1,
                 };
                 Some(JValue::Int(idx))
             }
             ("java/lang/String", "trim") => {
-                let s = this.borrow().as_java_string().unwrap_or("").trim().to_owned();
+                let s = this
+                    .borrow()
+                    .java_string_to_string_lossy()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
                 Some(JValue::Ref(Some(JObject::new_string(s))))
             }
             ("java/lang/String", "toLowerCase") => {
-                let s = this.borrow().as_java_string().unwrap_or("").to_lowercase();
+                let s = this
+                    .borrow()
+                    .java_string_to_string_lossy()
+                    .unwrap_or_default()
+                    .to_lowercase();
                 Some(JValue::Ref(Some(JObject::new_string(s))))
             }
             ("java/lang/String", "toUpperCase") => {
-                let s = this.borrow().as_java_string().unwrap_or("").to_uppercase();
+                let s = this
+                    .borrow()
+                    .java_string_to_string_lossy()
+                    .unwrap_or_default()
+                    .to_uppercase();
                 Some(JValue::Ref(Some(JObject::new_string(s))))
             }
             ("java/lang/String", "toCharArray") => {
-                let s = this.borrow().as_java_string().unwrap_or("").to_owned();
-                let chars: Vec<JValue> = s.chars().map(|c| JValue::Int(c as i32)).collect();
+                let chars: Vec<JValue> = this
+                    .borrow()
+                    .as_java_string_utf16()
+                    .map(|s| s.iter().map(|c| JValue::Int(i32::from(*c))).collect())
+                    .unwrap_or_default();
                 Some(JValue::Ref(Some(JObject::new_array("[C", chars))))
             }
             ("java/lang/String", "getBytes") => {
-                let s = this.borrow().as_java_string().unwrap_or("").to_owned();
+                let s = this
+                    .borrow()
+                    .java_string_to_string_lossy()
+                    .unwrap_or_default();
                 let bytes: Vec<JValue> = s.bytes().map(|b| JValue::Int(b as i32)).collect();
                 Some(JValue::Ref(Some(JObject::new_array("[B", bytes))))
             }
             ("java/lang/String", "replace") => {
-                let s = this.borrow().as_java_string().unwrap_or("").to_owned();
+                let s = this
+                    .borrow()
+                    .as_java_string_value()
+                    .cloned()
+                    .unwrap_or_else(|| JavaStringValue::from_utf16(Vec::new()));
                 if _args.len() >= 2 {
                     // replace(char, char)
                     if let (JValue::Int(old_c), JValue::Int(new_c)) = (&_args[0], &_args[1]) {
-                        let old_ch = char::from_u32(*old_c as u32).unwrap_or('\u{FFFD}');
-                        let new_ch = char::from_u32(*new_c as u32).unwrap_or('\u{FFFD}');
-                        let result = s.replace(old_ch, &new_ch.to_string());
-                        Some(JValue::Ref(Some(self.intern_string(result))))
+                        let result: Vec<u16> = s
+                            .utf16()
+                            .iter()
+                            .map(|c| if *c == (*old_c as u16) { *new_c as u16 } else { *c })
+                            .collect();
+                        Some(JValue::Ref(Some(JObject::new_string_utf16(result))))
                     } else {
                         // replace(CharSequence, CharSequence) — null args throw NPE per JDK spec
                         let old_ref = _args[0].as_ref();
@@ -1592,10 +1898,14 @@ impl super::Vm {
                             self.throw_null_pointer("String.replace: null argument");
                             return Some(JValue::Void);
                         }
-                        let old_str = old_ref.unwrap().borrow().as_java_string().unwrap_or("").to_owned();
-                        let new_str = new_ref.unwrap().borrow().as_java_string().unwrap_or("").to_owned();
-                        let result = s.replace(&old_str, &new_str);
-                        Some(JValue::Ref(Some(self.intern_string(result))))
+                        let old_str = old_ref
+                            .and_then(|_| arg_string_value(&_args[0]))
+                            .unwrap_or_else(|| JavaStringValue::from_utf16(Vec::new()));
+                        let new_str = new_ref
+                            .and_then(|_| arg_string_value(&_args[1]))
+                            .unwrap_or_else(|| JavaStringValue::from_utf16(Vec::new()));
+                        let result = u16_replace(s.utf16(), old_str.utf16(), new_str.utf16());
+                        Some(JValue::Ref(Some(JObject::new_string_utf16(result))))
                     }
                 } else {
                     Some(JValue::Ref(Some(Rc::clone(this))))

@@ -455,8 +455,8 @@ impl Vm {
                                 JValue::Float(v) => cs.result.push_str(&v.to_string()),
                                 JValue::Double(v) => cs.result.push_str(&v.to_string()),
                                 JValue::Ref(Some(r)) => {
-                                    if let Some(s) = r.borrow().as_java_string() {
-                                        cs.result.push_str(s);
+                                    if let Some(s) = r.borrow().java_string_to_string_lossy() {
+                                        cs.result.push_str(&s);
                                     } else {
                                         need_tostring = Some((r.clone(), r.borrow().class_name.clone()));
                                     }
@@ -499,7 +499,7 @@ impl Vm {
                         &r, &cn, "toString", "()Ljava/lang/String;", &[],
                     ) {
                         if let JValue::Ref(Some(sr)) = v {
-                            sr.borrow().as_java_string().unwrap_or("").to_owned()
+                            sr.borrow().java_string_to_string_lossy().unwrap_or_default()
                         } else {
                             cn.clone()
                         }
@@ -759,8 +759,8 @@ impl Vm {
 fn feed_concat_return(fi: &mut FrameInfo, ret: &JValue) {
     if let Some(ref mut cs) = fi.concat_state {
         if let JValue::Ref(Some(sr)) = ret {
-            if let Some(s) = sr.borrow().as_java_string() {
-                cs.result.push_str(s);
+            if let Some(s) = sr.borrow().java_string_to_string_lossy() {
+                cs.result.push_str(&s);
             }
         }
     }

@@ -391,7 +391,7 @@ fn jvalue_to_string(v: &JValue) -> String {
         JValue::Ref(Some(r)) => {
             let obj = r.borrow();
             match &obj.native {
-                heap::NativePayload::JavaString(s) => s.clone(),
+                heap::NativePayload::JavaString(s) => s.to_string_lossy(),
                 heap::NativePayload::Array(v) => format!(
                     "[{}]",
                     v.iter()
