@@ -64,10 +64,6 @@ pub(super) fn read_i32(code: &[u8], pc: &mut usize) -> i32 {
 // Constant pool resolution
 // ---------------------------------------------------------------------------
 
-pub(super) fn resolve_class_name(cp: &[ConstantPoolEntry], idx: u16) -> String {
-    resolve_class_name_ref(cp, idx).to_owned()
-}
-
 pub(super) fn resolve_class_name_ref<'a>(cp: &'a [ConstantPoolEntry], idx: u16) -> &'a str {
     match &cp[idx as usize] {
         ConstantPoolEntry::Class { name_index } => {
