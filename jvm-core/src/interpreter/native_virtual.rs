@@ -1093,8 +1093,7 @@ impl super::Vm {
                 self.ensure_class_ready(&target);
                 let anns = if let Some(cf) = self.get_class(&target) {
                     let attrs = cf.attributes.clone();
-                    let cp_entries = cf.constant_pool.entries.clone();
-                    let cp = crate::class_file::ConstantPool { entries: cp_entries };
+                    let cp = cf.constant_pool.clone();
                     self.parse_runtime_visible_annotations(&attrs, &cp)
                 } else {
                     Vec::new()
@@ -1261,8 +1260,7 @@ impl super::Vm {
                             && cf.constant_pool.utf8(m.descriptor_index) == desc
                     }) {
                         let attrs = mi.attributes.clone();
-                        let cp_entries = cf.constant_pool.entries.clone();
-                        let cp = crate::class_file::ConstantPool { entries: cp_entries };
+                        let cp = cf.constant_pool.clone();
                         self.parse_runtime_visible_parameter_annotations(&attrs, &cp, param_count)
                     } else {
                         vec![Vec::new(); param_count]
@@ -1355,8 +1353,7 @@ impl super::Vm {
                         cf.constant_pool.utf8(m.name_index) == name && cf.constant_pool.utf8(m.descriptor_index) == desc
                     }) {
                         let attrs = mi.attributes.clone();
-                        let cp_entries = cf.constant_pool.entries.clone();
-                        let cp = crate::class_file::ConstantPool { entries: cp_entries };
+                        let cp = cf.constant_pool.clone();
                         self.parse_runtime_visible_annotations(&attrs, &cp)
                     } else {
                         Vec::new()
@@ -1413,8 +1410,7 @@ impl super::Vm {
                         cf.constant_pool.utf8(m.name_index) == "<init>" && cf.constant_pool.utf8(m.descriptor_index) == desc
                     }) {
                         let attrs = mi.attributes.clone();
-                        let cp_entries = cf.constant_pool.entries.clone();
-                        let cp = crate::class_file::ConstantPool { entries: cp_entries };
+                        let cp = cf.constant_pool.clone();
                         self.parse_runtime_visible_annotations(&attrs, &cp)
                     } else {
                         Vec::new()
@@ -1510,8 +1506,7 @@ impl super::Vm {
                         cf.constant_pool.utf8(f.name_index) == name && cf.constant_pool.utf8(f.descriptor_index) == desc
                     }) {
                         let attrs = fi.attributes.clone();
-                        let cp_entries = cf.constant_pool.entries.clone();
-                        let cp = crate::class_file::ConstantPool { entries: cp_entries };
+                        let cp = cf.constant_pool.clone();
                         self.parse_runtime_visible_annotations(&attrs, &cp)
                     } else {
                         Vec::new()
@@ -1547,8 +1542,7 @@ impl super::Vm {
                                     && cf.constant_pool.utf8(c.descriptor_index) == desc
                             }) {
                                 let attrs = c.attributes.clone();
-                                let cp_entries = cf.constant_pool.entries.clone();
-                                let cp = crate::class_file::ConstantPool { entries: cp_entries };
+                                let cp = cf.constant_pool.clone();
                                 return Some((attrs, cp));
                             }
                         }

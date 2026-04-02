@@ -39,6 +39,8 @@ pub(super) struct MethodExecInfo {
     pub exception_table: Vec<ExceptionTableEntry>,
     /// Shared constant-pool entries (`Rc` for O(1) clone).
     pub cp: Rc<Vec<ConstantPoolEntry>>,
+    /// Per-constant-pool resolution cache from the owning class.
+    pub cache: cp_cache::CpCache,
     /// Bootstrap methods from the `BootstrapMethods` attribute.
     pub bootstrap_methods: Vec<BootstrapMethod>,
     /// `access_flags` from the method_info entry.
@@ -254,6 +256,7 @@ pub(in crate::interpreter) enum LazyClass {
 
 mod annotations;
 mod bytecode;
+pub(crate) mod cp_cache;
 mod descriptors;
 mod dispatch;
 mod frame;
@@ -1428,6 +1431,7 @@ impl Vm {
                 (0, false, vec![], vec![])
             };
         let cp = Rc::clone(&class.constant_pool.entries);
+        let cache = Rc::clone(&class.constant_pool.cache);
         let bootstrap_methods = class.attributes.iter().find_map(|a| {
             if let Attribute::BootstrapMethods(bms) = a { Some(bms.clone()) } else { None }
         }).unwrap_or_default();
@@ -1440,6 +1444,7 @@ impl Vm {
             code,
             exception_table,
             cp,
+            cache,
             bootstrap_methods,
         })
     }

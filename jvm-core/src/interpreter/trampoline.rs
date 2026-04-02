@@ -3,6 +3,7 @@ use std::rc::Rc;
 use crate::class_file::{BootstrapMethod, ConstantPoolEntry, ExceptionTableEntry};
 use crate::heap::{JObject, JRef, JValue};
 
+use super::cp_cache::CpCache;
 use super::descriptors::*;
 use super::frame::*;
 use super::Vm;
@@ -16,6 +17,8 @@ pub(crate) struct FrameInfo {
     pub frame: Frame,
     pub code: Vec<u8>,
     pub cp: Rc<Vec<ConstantPoolEntry>>,
+    /// Per-constant-pool resolution cache (shared across all frames using the same cp).
+    pub cache: CpCache,
     pub frame_owner: String,
     pub bootstrap_methods: Vec<BootstrapMethod>,
     pub exception_table: Vec<ExceptionTableEntry>,
@@ -83,7 +86,7 @@ impl Vm {
             fi.frame.pc += 1;
 
             let result = self.execute_opcode(
-                &mut fi.frame, &fi.code, &fi.cp, &fi.frame_owner,
+                &mut fi.frame, &fi.code, &fi.cp, &fi.cache, &fi.frame_owner,
                 &fi.bootstrap_methods, &fi.exception_table, opcode,
             );
 
@@ -165,7 +168,7 @@ impl Vm {
             steps += 1;
 
             let result = self.execute_opcode(
-                &mut fi.frame, &fi.code, &fi.cp, &fi.frame_owner,
+                &mut fi.frame, &fi.code, &fi.cp, &fi.cache, &fi.frame_owner,
                 &fi.bootstrap_methods, &fi.exception_table, opcode,
             );
 
@@ -594,7 +597,7 @@ impl Vm {
         };
         Ok(Some(FrameInfo {
             frame: Frame { locals, stack: Vec::new(), pc: 0 },
-            code: info.code, cp: info.cp, frame_owner: fo,
+            code: info.code, cp: info.cp, cache: info.cache, frame_owner: fo,
             bootstrap_methods: info.bootstrap_methods, exception_table: info.exception_table,
             push_return, concat_state: None, lambda_return_adapt: None,
             synchronized_monitor,
@@ -677,7 +680,7 @@ impl Vm {
         let synchronized_monitor = self.acquire_instance_synchronized_monitor(info.access_flags, &locals);
         Ok(Some(FrameInfo {
             frame: Frame { locals, stack: Vec::new(), pc: 0 },
-            code: info.code, cp: info.cp, frame_owner: fo,
+            code: info.code, cp: info.cp, cache: info.cache, frame_owner: fo,
             bootstrap_methods: info.bootstrap_methods, exception_table: info.exception_table,
             push_return, concat_state: None, lambda_return_adapt: None,
             synchronized_monitor,
@@ -733,7 +736,7 @@ impl Vm {
         let synchronized_monitor = self.acquire_instance_synchronized_monitor(info.access_flags, &locals);
         Ok(Some(FrameInfo {
             frame: Frame { locals, stack: Vec::new(), pc: 0 },
-            code: info.code, cp: info.cp, frame_owner: fo,
+            code: info.code, cp: info.cp, cache: info.cache, frame_owner: fo,
             bootstrap_methods: info.bootstrap_methods, exception_table: info.exception_table,
             push_return, concat_state: None, lambda_return_adapt: None,
             synchronized_monitor,

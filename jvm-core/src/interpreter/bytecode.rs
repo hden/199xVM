@@ -3,6 +3,7 @@ use crate::class_file::{BootstrapMethod, ConstantPoolEntry, ExceptionTableEntry}
 use crate::heap::{JObject, JValue, NativePayload};
 
 use super::Vm;
+use super::cp_cache::{CpCache, CpCacheEntry, ResolvedFieldEntry};
 use super::descriptors::*;
 use super::frame::*;
 
@@ -53,8 +54,8 @@ impl Vm {
                 return Some((entry.handler_pc as usize, exc_obj));
             }
             // Resolve catch_type to class name and check if exception is instance.
-            let catch_class = resolve_class_name(cp, entry.catch_type);
-            if exc_class == catch_class || self.is_instance_of(exc_class, &catch_class) {
+            let catch_class = resolve_class_name_ref(cp, entry.catch_type);
+            if exc_class == catch_class || self.is_instance_of(exc_class, catch_class) {
                 let exc_obj = self.take_or_create_exception(exc_class, err_msg);
                 return Some((entry.handler_pc as usize, exc_obj));
             }
@@ -92,6 +93,7 @@ impl Vm {
         frame: &mut Frame,
         code: &[u8],
         cp: &[ConstantPoolEntry],
+        cache: &CpCache,
         class_name: &str,
         bootstrap_methods: &[BootstrapMethod],
         _exception_table: &[ExceptionTableEntry],
@@ -675,20 +677,71 @@ impl Vm {
                 // ---- Field access ----
                 0xb2 => { // getstatic
                     let idx = read_u16(code, &mut frame.pc);
-                    let v = self.resolve_static_field(cp, idx)?;
-                    frame.stack.push(v);
+                    // Fast path: check cpCache for resolved field.
+                    let cached_val = {
+                        let cb = cache.borrow();
+                        if let Some(Some(CpCacheEntry::Field(e))) = cb.get(idx as usize) {
+                            let v = self.static_fields.get(&e.owner_class)
+                                .and_then(|m| m.get(&e.field_name))
+                                .cloned()
+                                .unwrap_or_else(|| default_value_for_descriptor(&e.field_descriptor));
+                            Some(v)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(v) = cached_val {
+                        frame.stack.push(v);
+                    } else {
+                        // Slow path: resolve, push, then populate cache.
+                        let v = self.resolve_static_field(cp, idx)?;
+                        frame.stack.push(v.clone());
+                        // Populate cache with the resolved field owner.
+                        let (cn, fn_, fd) = resolve_fieldref_ref(cp, idx);
+                        let owner = self.find_static_field_owner_class(cn, fn_)
+                            .unwrap_or_else(|| cn.to_owned());
+                        cache.borrow_mut()[idx as usize] = Some(CpCacheEntry::Field(
+                            ResolvedFieldEntry {
+                                owner_class: owner,
+                                field_name: fn_.to_owned(),
+                                field_descriptor: fd.to_owned(),
+                            }
+                        ));
+                    }
                 }
                 0xb3 => { // putstatic
                     let idx = read_u16(code, &mut frame.pc);
                     let val = frame.stack.pop().unwrap_or(JValue::Void);
-                    let (cls, fld, _) = resolve_fieldref(cp, idx);
-                    // Per JVMS §5.5: putstatic triggers class initialization.
-                    self.ensure_class_init(&cls)?;
-                    self.static_fields.entry(cls).or_default().insert(fld, val);
+                    // Fast path: check cpCache.
+                    let cached = {
+                        let cb = cache.borrow();
+                        match cb.get(idx as usize) {
+                            Some(Some(CpCacheEntry::Field(e))) => Some((
+                                e.owner_class.clone(), e.field_name.clone(),
+                            )),
+                            _ => None,
+                        }
+                    };
+                    if let Some((owner, field)) = cached {
+                        self.static_fields.entry(owner).or_default().insert(field, val);
+                    } else {
+                        // Slow path.
+                        let (cls, fld, fd) = resolve_fieldref_ref(cp, idx);
+                        self.ensure_class_init(cls)?;
+                        self.static_fields.entry(cls.to_owned()).or_default().insert(fld.to_owned(), val);
+                        // Populate cache.
+                        cache.borrow_mut()[idx as usize] = Some(CpCacheEntry::Field(
+                            ResolvedFieldEntry {
+                                owner_class: cls.to_owned(),
+                                field_name: fld.to_owned(),
+                                field_descriptor: fd.to_owned(),
+                            }
+                        ));
+                    }
                 }
                 0xb4 => { // getfield
                     let idx = read_u16(code, &mut frame.pc);
-                    let (_, gf_field_name, _) = resolve_fieldref(cp, idx);
+                    let (_, gf_field_name, _) = resolve_fieldref_ref(cp, idx);
                     let obj_ref = frame.stack.pop()
                         .ok_or_else(|| format!("getfield {gf_field_name}: empty stack in {class_name}"))?;
                     if matches!(obj_ref, JValue::Void) {
@@ -704,7 +757,7 @@ impl Vm {
                     let val = frame.stack.pop().unwrap_or(JValue::Void);
                     let obj_ref = frame.stack.pop().unwrap_or(JValue::Void);
                     if matches!(obj_ref, JValue::Void) {
-                        let (_, pf_field_name, _) = resolve_fieldref(cp, idx);
+                        let (_, pf_field_name, _) = resolve_fieldref_ref(cp, idx);
                         return Err(format!(
                             "putfield {pf_field_name}: expected Ref on stack, got Void in {class_name}"
                         ));
@@ -730,7 +783,7 @@ impl Vm {
                 }
                 0xb8 => { // invokestatic
                     let idx = read_u16(code, &mut frame.pc);
-                    self.dispatch_static(cp, idx, frame)?;
+                    self.dispatch_static(cp, cache, idx, frame)?;
                 }
                 0xb9 => { // invokeinterface
                     let idx = read_u16(code, &mut frame.pc);
@@ -749,20 +802,20 @@ impl Vm {
                 // ---- Object creation ----
                 0xbb => { // new
                     let idx = read_u16(code, &mut frame.pc);
-                    let new_class = resolve_class_name(cp, idx);
+                    let new_class = resolve_class_name_ref(cp, idx);
                     // Run <clinit> for the class being instantiated.
-                    self.ensure_class_init(&new_class)?;
+                    self.ensure_class_init(new_class)?;
                     // A ParseError entry means the class was registered but malformed —
                     // surface consistently as ClassFormatError (same as Class.forName0 path).
-                    if matches!(self.classes.get(&new_class), Some(super::LazyClass::ParseError(_))) {
-                        self.throw_class_format_error(&new_class);
+                    if matches!(self.classes.get(new_class), Some(super::LazyClass::ParseError(_))) {
+                        self.throw_class_format_error(new_class);
                         return Err(format!("java/lang/ClassFormatError: malformed class file for {new_class}"));
                     }
-                    let obj = if self.get_class(&new_class).is_some() {
+                    let obj = if self.get_class(new_class).is_some() {
                         // Class is loaded (bytecode available) — use plain object.
                         JObject::new(new_class)
                     } else {
-                        match new_class.as_str() {
+                        match new_class {
                             // JDK collection types backed by Array payload (no shim loaded).
                             "java/util/ArrayList" | "java/util/LinkedList" =>
                                 JObject::new_array(new_class, vec![]),
@@ -793,7 +846,7 @@ impl Vm {
                 }
                 0xbd => { // anewarray
                     let idx = read_u16(code, &mut frame.pc);
-                    let elem_class = resolve_class_name(cp, idx);
+                    let elem_class = resolve_class_name_ref(cp, idx);
                     let count_int = frame.stack.pop().unwrap().as_int();
                     if count_int < 0 {
                         return Err(format!("java/lang/NegativeArraySizeException: {count_int}"));
@@ -809,7 +862,7 @@ impl Vm {
                     let idx = read_u16(code, &mut frame.pc);
                     let dimensions = code[frame.pc] as usize;
                     frame.pc += 1;
-                    let class_name_str = resolve_class_name(cp, idx);
+                    let class_name_str = resolve_class_name_ref(cp, idx);
                     let mut dim_sizes = Vec::with_capacity(dimensions);
                     for _ in 0..dimensions {
                         let n = frame.stack.pop().unwrap().as_int();
@@ -819,7 +872,7 @@ impl Vm {
                         dim_sizes.push(n as usize);
                     }
                     dim_sizes.reverse();
-                    let arr = self.create_multi_array(&class_name_str, &dim_sizes, 0);
+                    let arr = self.create_multi_array(class_name_str, &dim_sizes, 0);
                     frame.stack.push(JValue::Ref(Some(arr)));
                 }
                 0xbe => { // arraylength
@@ -840,7 +893,7 @@ impl Vm {
                 // ---- instanceof / checkcast ----
                 0xc0 => { // checkcast — per JVMS §6.5.checkcast
                     let idx = read_u16(code, &mut frame.pc);
-                    let target_class = resolve_class_name(cp, idx);
+                    let target_class = resolve_class_name_ref(cp, idx);
                     // Peek at top of stack (don't pop — value stays if check passes).
                     let obj = frame.stack.last()
                         .ok_or_else(|| "checkcast: empty stack".to_owned())?;
@@ -848,7 +901,7 @@ impl Vm {
                         None => {} // null passes checkcast
                         Some(r) => {
                             let cn = r.borrow().class_name.clone();
-                            if !self.is_instance_of(&cn, &target_class) {
+                            if !self.is_instance_of(&cn, target_class) {
                                 return Err(format!(
                                     "ClassCastException: {} cannot be cast to {}",
                                     cn.replace('/', "."),
@@ -860,13 +913,13 @@ impl Vm {
                 }
                 0xc1 => { // instanceof
                     let idx = read_u16(code, &mut frame.pc);
-                    let target_class = resolve_class_name(cp, idx);
+                    let target_class = resolve_class_name_ref(cp, idx);
                     let obj = frame.stack.pop().unwrap();
                     let is_instance = match obj.as_ref() {
                         None => false,
                         Some(r) => {
                             let cn = r.borrow().class_name.clone();
-                            self.is_instance_of(&cn, &target_class)
+                            self.is_instance_of(&cn, target_class)
                         }
                     };
                     frame.stack.push(JValue::Int(is_instance as i32));
@@ -977,8 +1030,8 @@ impl Vm {
             }
             ConstantPoolEntry::Class { name_index } => {
                 let name = match &cp[*name_index as usize] {
-                    ConstantPoolEntry::Utf8(s) => s.clone(),
-                    _ => String::new(),
+                    ConstantPoolEntry::Utf8(s) => s.as_str(),
+                    _ => "",
                 };
                 let obj = self.class_object(name);
                 frame.stack.push(JValue::Ref(Some(obj)));
@@ -995,22 +1048,22 @@ impl Vm {
         cp: &[ConstantPoolEntry],
         idx: u16,
     ) -> Result<JValue, String> {
-        let (class_name, field_name, descriptor) = resolve_fieldref(cp, idx);
+        let (class_name, field_name, descriptor) = resolve_fieldref_ref(cp, idx);
         // Run <clinit> if not yet done (initialises static fields via putstatic).
-        self.ensure_class_init(&class_name)?;
+        self.ensure_class_init(class_name)?;
         // Search this class and its super-class chain for the static field (JVMS §5.4.3.2).
-        if let Some(v) = self.resolve_static_field_in_hierarchy(&class_name, &field_name) {
+        if let Some(v) = self.resolve_static_field_in_hierarchy(class_name, field_name) {
             return Ok(v);
         }
         // Well-known JDK static fields that cannot be initialised via <clinit>
         // because the JDK classes are not in the bundle.
-        match (class_name.as_str(), field_name.as_str()) {
+        match (class_name, field_name) {
             ("java/lang/System", "out") => {
                 if let Some(v) = self.static_fields.get("java/lang/System").and_then(|m| m.get("out")) {
                     return Ok(v.clone());
                 }
                 let v = JValue::Ref(Some(JObject::new_print_stream(false)));
-                self.static_fields.entry(class_name).or_default().insert(field_name, v.clone());
+                self.static_fields.entry(class_name.to_owned()).or_default().insert(field_name.to_owned(), v.clone());
                 Ok(v)
             }
             ("java/lang/System", "err") => {
@@ -1018,7 +1071,7 @@ impl Vm {
                     return Ok(v.clone());
                 }
                 let v = JValue::Ref(Some(JObject::new_print_stream(true)));
-                self.static_fields.entry(class_name).or_default().insert(field_name, v.clone());
+                self.static_fields.entry(class_name.to_owned()).or_default().insert(field_name.to_owned(), v.clone());
                 Ok(v)
             }
             ("java/lang/System", "in") => {
@@ -1031,10 +1084,10 @@ impl Vm {
                 let stdin = JObject::new_process_pipe_input_stream();
                 let v = JValue::Ref(Some(stdin.clone()));
                 self.system_stdin = Some(stdin);
-                self.static_fields.entry(class_name).or_default().insert(field_name, v.clone());
+                self.static_fields.entry(class_name.to_owned()).or_default().insert(field_name.to_owned(), v.clone());
                 Ok(v)
             }
-            _ => Ok(default_value_for_descriptor(&descriptor)),
+            _ => Ok(default_value_for_descriptor(descriptor)),
         }
     }
 
@@ -1072,17 +1125,49 @@ impl Vm {
         None
     }
 
+    /// Walk the class hierarchy to find which class owns a static field.
+    fn find_static_field_owner_class(&mut self, class_name: &str, field_name: &str) -> Option<String> {
+        if self.static_fields.get(class_name).and_then(|m| m.get(field_name)).is_some() {
+            return Some(class_name.to_owned());
+        }
+        self.ensure_class_ready(class_name);
+        let (super_name, iface_names) = if let Some(class) = self.get_class(class_name) {
+            let sup = if class.super_class != 0 {
+                Some(class.constant_pool.class_name(class.super_class).to_owned())
+            } else {
+                None
+            };
+            let ifaces: Vec<String> = class.interfaces.iter()
+                .map(|&idx| class.constant_pool.class_name(idx).to_owned())
+                .collect();
+            (sup, ifaces)
+        } else {
+            (None, vec![])
+        };
+        if let Some(s) = super_name {
+            if let Some(owner) = self.find_static_field_owner_class(&s, field_name) {
+                return Some(owner);
+            }
+        }
+        for iface in iface_names {
+            if let Some(owner) = self.find_static_field_owner_class(&iface, field_name) {
+                return Some(owner);
+            }
+        }
+        None
+    }
+
     fn resolve_instance_field(
         &mut self,
         cp: &[ConstantPoolEntry],
         idx: u16,
         obj_ref: &JValue,
     ) -> Result<JValue, String> {
-        let (_, field_name, field_desc) = resolve_fieldref(cp, idx);
+        let (_, field_name, field_desc) = resolve_fieldref_ref(cp, idx);
         match obj_ref.as_ref() {
             Some(r) => {
-                let default = default_value_for_descriptor(&field_desc);
-                Ok(r.borrow().fields.get(&field_name).cloned().unwrap_or(default))
+                let default = default_value_for_descriptor(field_desc);
+                Ok(r.borrow().fields.get(field_name).cloned().unwrap_or(default))
             }
             None => Err(format!("NullPointerException: getfield {field_name}")),
         }
@@ -1095,9 +1180,9 @@ impl Vm {
         obj_ref: &JValue,
         val: JValue,
     ) -> Result<(), String> {
-        let (_, field_name, _) = resolve_fieldref(cp, idx);
+        let (_, field_name, _) = resolve_fieldref_ref(cp, idx);
         match obj_ref.as_ref() {
-            Some(r) => { r.borrow_mut().fields.insert(field_name, val); Ok(()) }
+            Some(r) => { r.borrow_mut().fields.insert(field_name.to_owned(), val); Ok(()) }
             None => Err(format!("NullPointerException: putfield {field_name}")),
         }
     }

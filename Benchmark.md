@@ -38,6 +38,7 @@ Results are written to `target/criterion/` as HTML reports.
 |---|---|---|
 | `method_call_1000x` | `BenchMethodCall.run()` | O(n) method lookup + constant pool clone per static call |
 | `static_field_1000x` | `BenchStaticField.run()` | `format!` string allocation on every `getstatic`/`putstatic` |
+| `inherited_static_field_1000x` | `BenchInheritedStaticField.run()` | inherited `getstatic`/`putstatic` owner resolution on every access |
 | `string_ldc_1000x` | `BenchStringLdc.run()` | `String::clone` on every `ldc` string constant |
 | `virtual_call_1000x` | `BenchVirtualCall.run()` | Interface virtual dispatch + interface name list rebuild |
 | `string_utf16_ascii_10000x` | `BenchStringUtf16Ascii.run()` | ASCII baseline for UTF-16 string operations |
@@ -47,6 +48,9 @@ Results are written to `target/criterion/` as HTML reports.
 | `regex_find_cjk_10000x` | `BenchRegexFindCjk.run()` | CJK regression guard for byte/code-unit conversion in regex search |
 | `regex_find_emoji_10000x` | `BenchRegexFindEmoji.run()` | Surrogate-pair path guard for regex offset conversion |
 | `regex_find_empty_emoji_10000x` | `BenchRegexFindEmptyEmoji.run()` | Empty-pattern UTF-16 boundary enumeration on surrogate pairs |
+| `declared_methods_1000x` | `BenchDeclaredMethods.run()` | repeated `Class.getDeclaredMethods()` metadata rebuild |
+| `process_clinit_launch_to_exit` | `ClinitYieldProcessMain.main()` | launcher/process path when the first bytecode schedules a heavy `<clinit>` |
+| `process_super_clinit_chain_launch_to_exit` | `ClinitChainYieldProcessMain.main()` | launcher/process path when class initialization walks a heavy superclass chain |
 
 Each Java method runs an inner loop of either 1000 or 10000 iterations so the per-call overhead is amplified and measurable above criterion's noise floor.
 
@@ -95,6 +99,9 @@ Current guardrails:
 - `regex_find_emoji / regex_find_ascii <= 12x`
 
 `regex_find_empty_emoji_10000x` is benchmarked in Criterion but intentionally not used as a hard PR gate because the path is correctness-sensitive and more timing-noise-prone.
+
+The historical tables below predate the later inherited-static-field, class-init, and UTF-16/regex
+scenarios, so they currently cover only the original four microbenchmarks.
 
 ## Baseline (2026-03-12, unoptimized interpreter)
 
