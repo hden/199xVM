@@ -7,7 +7,7 @@ use crate::heap::{JavaStringValue, JObject, JRef, JValue, NativePayload};
 
 use super::LazyClass;
 use super::descriptors::*;
-use super::native_static::regex_encode_java_string;
+use super::native_static::{regex_encode_java_string, regex_full_match_source};
 
 #[cfg(target_arch = "wasm32")]
 use super::{console_error, console_log};
@@ -671,34 +671,37 @@ impl super::Vm {
                 Some(JValue::Ref(Some(m)))
             }
             ("java/util/regex/Matcher", "matches") => {
-                let (regex, input_value) = {
+                let (regex, flags, input_value) = {
                     let mb = this.borrow();
                     // Try bytecode field names first, then native field names
                     let pattern_ref = mb.fields.get("pattern")
                         .or_else(|| mb.fields.get("__pattern"));
-                    let regex = pattern_ref
+                    let (regex, flags) = pattern_ref
                         .and_then(|v| v.as_ref())
-                        .and_then(|p| {
+                        .map(|p| {
                             let pb = p.borrow();
                             // Try bytecode field name "regex" first, then native "__regex"
-                            pb.fields.get("regex")
+                            let regex = pb.fields.get("regex")
                                 .or_else(|| pb.fields.get("__regex"))
                                 .and_then(|v| v.as_ref().cloned())
                                 .and_then(|s| s.borrow().as_java_string_value().cloned())
                                 .map(|s| regex_encode_java_string(&s).into_owned())
+                                .unwrap_or_default();
+                            let flags = pb.fields.get("__flags").map(|v| v.as_int()).unwrap_or(0);
+                            (regex, flags)
                         })
-                        .unwrap_or_default();
+                        .unwrap_or_else(|| (String::new(), 0));
                     let input = mb.fields.get("input")
                         .or_else(|| mb.fields.get("__input"))
                         .and_then(|v| v.as_ref())
                         .and_then(|s| s.borrow().as_java_string_value().cloned())
                         .unwrap_or_else(|| JavaStringValue::from_utf16(Vec::new()));
-                    (regex, input)
+                    (regex, flags, input)
                 };
                 let input_text = regex_encode_java_string(&input_value);
                 // Use captures to extract groups
-                let anchored = format!("^(?:{regex})$");
-                let re = regex::Regex::new(&anchored).ok();
+                let anchored = regex_full_match_source(&regex);
+                let re = self.compile_regex_cached(&anchored, flags);
                 let caps = re.as_ref().and_then(|r| r.captures(input_text.as_ref()));
                 let ok = caps.is_some();
                 // Store captured groups in __groups array field + matchStart/matchEnd
@@ -736,24 +739,27 @@ impl super::Vm {
                 Some(JValue::Int(if ok { 1 } else { 0 }))
             }
             ("java/util/regex/Matcher", "find") => {
-                let (regex, input_value, search_index) = {
+                let (regex, flags, input_value, search_index) = {
                     let mb = this.borrow();
                     let pattern_ref = mb
                         .fields
                         .get("pattern")
                         .or_else(|| mb.fields.get("__pattern"));
-                    let regex = pattern_ref
+                    let (regex, flags) = pattern_ref
                         .and_then(|v| v.as_ref())
-                        .and_then(|p| {
+                        .map(|p| {
                             let pb = p.borrow();
-                            pb.fields
+                            let regex = pb.fields
                                 .get("regex")
                                 .or_else(|| pb.fields.get("__regex"))
                                 .and_then(|v| v.as_ref().cloned())
                                 .and_then(|s| s.borrow().as_java_string_value().cloned())
                                 .map(|s| regex_encode_java_string(&s).into_owned())
+                                .unwrap_or_default();
+                            let flags = pb.fields.get("__flags").map(|v| v.as_int()).unwrap_or(0);
+                            (regex, flags)
                         })
-                        .unwrap_or_default();
+                        .unwrap_or_else(|| (String::new(), 0));
                     let input = mb
                         .fields
                         .get("input")
@@ -766,7 +772,7 @@ impl super::Vm {
                         .get("searchIndex")
                         .map(|v| v.as_int().max(0) as usize)
                         .unwrap_or(0);
-                    (regex, input, search_index)
+                    (regex, flags, input, search_index)
                 };
                 let input_len = input_value.len_utf16();
 
@@ -817,7 +823,7 @@ impl super::Vm {
                 }
 
                 let input_text = regex_encode_java_string(&input_value);
-                let re = regex::Regex::new(&regex).ok();
+                let re = self.compile_regex_cached(&regex, flags);
                 let start_byte = utf16_index_to_byte_offset(input_text.as_ref(), search_index);
                 let hay = &input_text.as_ref()[start_byte..];
                 let caps = re.as_ref().and_then(|r| r.captures(hay));
