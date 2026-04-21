@@ -18,6 +18,7 @@ use crate::class_file::{
     self, Attribute, BootstrapMethod, ClassFile, ConstantPoolEntry, ExceptionTableEntry,
 };
 use crate::heap::{JavaStringValue, JObject, JRef, JValue};
+use class_identity::{ClassId, ClassIdentityRegistry, LoaderId};
 
 type OwnedJarArchive = zip::ZipArchive<std::io::Cursor<Vec<u8>>>;
 
@@ -256,6 +257,7 @@ pub(in crate::interpreter) enum LazyClass {
 
 mod annotations;
 mod bytecode;
+pub(crate) mod class_identity;
 pub(crate) mod cp_cache;
 mod descriptors;
 mod dispatch;
@@ -513,10 +515,14 @@ impl Scheduler {
 
 /// The central virtual machine that holds loaded classes and drives execution.
 pub struct Vm {
-    /// Class registry: keyed by internal name (`net/unit8/raoh/Result`).
+    /// Legacy class registry: keyed by internal name (`net/unit8/raoh/Result`).
+    /// Loader-scoped identity truth lives in `class_identities`; this map remains
+    /// as the Phase 1 bytecode storage path until execution is migrated.
     /// Entries start as `LazyClass::PendingBytes`/`PendingJarEntry` and are promoted to
     /// `LazyClass::Ready` (parsed `ClassFile`) on first access.
     pub(in crate::interpreter) classes: HashMap<String, LazyClass>,
+    /// Loader-owned class identity records for defining and initiating loaders.
+    class_identities: ClassIdentityRegistry,
     /// Interned strings cache keyed by UTF-16 content.
     pub(in crate::interpreter) string_pool: HashMap<JavaStringValue, JRef>,
     /// Static field storage keyed by class name → field name.
@@ -554,8 +560,8 @@ pub struct Vm {
     pub(in crate::interpreter) scheduler: Scheduler,
     /// Object monitors keyed by object identity (Rc pointer address).
     monitors: HashMap<usize, Monitor>,
-    /// Method resolution cache: (class, method_name, descriptor) → owner class name.
-    /// Avoids repeated super-chain walks for the same method lookup.
+    /// Legacy method resolution cache: (class, method_name, descriptor) → owner class name.
+    /// Loader-unsafe until the cpCache/member-resolution migration carries ClassId.
     method_owner_cache: HashMap<(String, String, String), Option<String>>,
     /// Bounded LRU cache for compiled host-side regular expressions.
     regex_cache: RegexCache,
@@ -572,6 +578,7 @@ impl Vm {
     pub fn new() -> Self {
         Vm {
             classes: HashMap::new(),
+            class_identities: ClassIdentityRegistry::new(),
             string_pool: HashMap::new(),
             static_fields: HashMap::new(),
             clinit_done: HashSet::new(),
@@ -976,9 +983,36 @@ impl Vm {
         }
     }
 
+    pub(crate) fn register_defined_class(
+        &mut self,
+        defining_loader: LoaderId,
+        internal_name: impl Into<String>,
+    ) -> ClassId {
+        self.class_identities.register_defined_class(defining_loader, internal_name)
+    }
+
+    pub(crate) fn record_initiating_loader(
+        &mut self,
+        initiating_loader: LoaderId,
+        lookup_name: impl Into<String>,
+        class_id: ClassId,
+    ) {
+        self.class_identities.record_initiating_loader(initiating_loader, lookup_name, class_id);
+    }
+
     /// Register a pre-parsed class file (always stored as `Ready`).
     pub fn load_class(&mut self, class_file: ClassFile) {
+        self.load_class_with_loader(LoaderId::SYSTEM, class_file);
+    }
+
+    pub(crate) fn load_class_with_loader(
+        &mut self,
+        defining_loader: LoaderId,
+        class_file: ClassFile,
+    ) {
         let name = class_file.constant_pool.class_name(class_file.this_class).to_owned();
+        let class_id = self.register_defined_class(defining_loader, name.clone());
+        self.record_initiating_loader(defining_loader, name.clone(), class_id);
         self.classes.insert(name, LazyClass::Ready(class_file));
     }
 
@@ -986,10 +1020,24 @@ impl Vm {
     /// The class is parsed only when first accessed via [`Self::ensure_class_ready`].
     /// If the class is already registered (e.g., as `Ready`), the existing entry is kept.
     pub fn load_lazy(&mut self, name: String, bytes: Vec<u8>) {
+        self.load_lazy_with_loader(LoaderId::SYSTEM, name, bytes);
+    }
+
+    pub(crate) fn load_lazy_with_loader(
+        &mut self,
+        defining_loader: LoaderId,
+        name: String,
+        bytes: Vec<u8>,
+    ) -> ClassId {
+        let class_id = self.register_defined_class(defining_loader, name.clone());
+        self.record_initiating_loader(defining_loader, name.clone(), class_id);
         self.classes.entry(name).or_insert(LazyClass::PendingBytes(bytes));
+        class_id
     }
 
     fn load_lazy_jar_entry(&mut self, name: String, entry: JarEntryRef) {
+        let class_id = self.register_defined_class(LoaderId::SYSTEM, name.clone());
+        self.record_initiating_loader(LoaderId::SYSTEM, name.clone(), class_id);
         self.classes.entry(name).or_insert(LazyClass::PendingJarEntry(entry));
     }
 
