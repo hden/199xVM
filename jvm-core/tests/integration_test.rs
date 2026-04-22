@@ -579,7 +579,7 @@ fn cp_cache_keeps_loader_distinct_member_owners_isolated() {
 }
 
 #[test]
-fn failed_symbolic_resolutions_repeat_same_error_family() {
+fn failed_symbolic_class_resolution_repeats_same_error_family() {
     let result = run_jar_test(
         "RepeatedResolutionFailureTest",
         "run",
@@ -589,6 +589,16 @@ fn failed_symbolic_resolutions_repeat_same_error_family() {
         result,
         "NoClassDefFoundError"
     );
+}
+
+#[test]
+fn anewarray_preserves_array_component_descriptor() {
+    let result = run_jar_test(
+        "AnewArrayComponentDescriptorTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "[[[Ljava.lang.String;");
 }
 
 // ---------------------------------------------------------------------------

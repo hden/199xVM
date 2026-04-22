@@ -11,8 +11,7 @@ use super::class_identity::ClassId;
 pub(crate) struct ResolvedMethodEntry {
     /// Loader-scoped owner class identity when known.
     pub owner_class_id: Option<ClassId>,
-    /// Legacy owner class name (the class that actually defines the method).
-    /// Loader-aware migration target: replace or pair with ClassId in Phase 3/4.
+    /// Legacy owner class name used when loader-scoped identity is not available.
     pub owner_class: String,
     /// Pre-extracted code bytes.
     pub code: Rc<Vec<u8>>,
