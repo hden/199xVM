@@ -587,9 +587,17 @@ impl super::Vm {
                 Some(JValue::Ref(Some(arr)))
             }
             ("java/lang/reflect/Array", "newInstance", "(Ljava/lang/Class;[I)Ljava/lang/Object;") => {
-                let component = _args
+                let component_class = _args
                     .first()
                     .and_then(|v| v.as_ref())
+                    .cloned();
+                let defining_loader = component_class
+                    .as_ref()
+                    .and_then(|c| self.class_id_from_class_object(c))
+                    .and_then(|class_id| self.class_record(class_id).map(|record| record.defining_loader))
+                    .unwrap_or(super::class_identity::LoaderId::BOOTSTRAP);
+                let component = component_class
+                    .as_ref()
                     .and_then(|c| self.class_internal_name_from_obj(c))
                     .unwrap_or_else(|| "java/lang/Object".to_owned());
                 let dims = _args
@@ -617,7 +625,11 @@ impl super::Vm {
                     _ => format!("L{component};"),
                 };
                 let desc = format!("{}{}", "[".repeat(dims.len()), base_desc);
-                Some(JValue::Ref(Some(self.create_multi_array(&desc, &dims, 0))))
+                Some(JValue::Ref(Some(self.create_multi_array_for_descriptor(
+                    &desc,
+                    defining_loader,
+                    &dims,
+                ))))
             }
             ("java/lang/reflect/Array", "getLength", "(Ljava/lang/Object;)I") => {
                 let len = _args

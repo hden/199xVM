@@ -8,8 +8,9 @@
 //! - Integer / long / reference comparisons and control flow
 //! - Native stubs for `java.lang.*` and `java.util.*`
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -545,6 +546,8 @@ pub struct Vm {
     pub(in crate::interpreter) clinit_failed: HashSet<String>,
     /// Canonical Class objects keyed by loader-scoped class identity.
     pub(in crate::interpreter) class_pool: HashMap<ClassId, JRef>,
+    /// Heap object identity to its loader-scoped class identity.
+    pub(in crate::interpreter) object_class_ids: HashMap<usize, (Weak<RefCell<JObject>>, ClassId)>,
     /// Buffered `System.out.print` content until newline/println.
     pub(in crate::interpreter) stdout_buffer: String,
     /// Buffered `System.err.print` content until newline/println.
@@ -599,6 +602,7 @@ impl Vm {
             clinit_done: HashSet::new(),
             clinit_failed: HashSet::new(),
             class_pool: HashMap::new(),
+            object_class_ids: HashMap::new(),
             stdout_buffer: String::new(),
             stderr_buffer: String::new(),
             stdin_mode: StdioMode::Pipe,
@@ -651,6 +655,18 @@ impl Vm {
     /// address reuse after deallocation.
     fn object_id(obj: &JRef) -> usize {
         Rc::as_ptr(obj) as *const () as usize
+    }
+
+    pub(in crate::interpreter) fn record_object_class_id(&mut self, obj: &JRef, class_id: ClassId) {
+        self.object_class_ids.insert(Self::object_id(obj), (Rc::downgrade(obj), class_id));
+    }
+
+    pub(in crate::interpreter) fn class_id_for_object(&self, obj: &JRef) -> Option<ClassId> {
+        let (recorded, class_id) = self.object_class_ids.get(&Self::object_id(obj))?;
+        recorded
+            .upgrade()
+            .filter(|existing| Rc::ptr_eq(existing, obj))
+            .map(|_| *class_id)
     }
 
     /// Acquire the monitor for the given object (monitorenter).
@@ -1624,15 +1640,15 @@ impl Vm {
             return self.resolve_array_class(caller_class_id, internal_name);
         }
 
-        let caller_loader = self
+        let initiating_loader = self
             .class_record(caller_class_id)
             .map(|record| record.defining_loader)
             .unwrap_or(LoaderId::SYSTEM);
-        if let Some(class_id) = self.class_id_for_initiating(caller_loader, internal_name) {
+        if let Some(class_id) = self.class_id_for_initiating(initiating_loader, internal_name) {
             return Ok(class_id);
         }
 
-        if let Some(loader_object) = self.classloader_objects.get(&caller_loader).cloned() {
+        if let Some(loader_object) = self.classloader_objects.get(&initiating_loader).cloned() {
             let binary_name_ref = self.intern_string(internal_name.replace('/', "."));
             let loader_class_name = loader_object.borrow().class_name.clone();
             match self.invoke_virtual(
@@ -1644,7 +1660,7 @@ impl Vm {
             ) {
                 Ok(JValue::Ref(Some(class_object))) => {
                     if let Some(class_id) = self.class_id_from_class_object(&class_object) {
-                        self.record_initiating_loader(caller_loader, internal_name.to_owned(), class_id);
+                        self.record_initiating_loader(initiating_loader, internal_name.to_owned(), class_id);
                         return Ok(class_id);
                     }
                 }
@@ -1660,11 +1676,11 @@ impl Vm {
             return Err(format!("java/lang/ClassFormatError: malformed class file for {internal_name}"));
         }
         let class_id = self
-            .class_id_for_defined(caller_loader, internal_name)
+            .class_id_for_defined(initiating_loader, internal_name)
             .or_else(|| self.class_id_for_defined(LoaderId::SYSTEM, internal_name))
             .or_else(|| self.class_id_for_defined(LoaderId::BOOTSTRAP, internal_name));
         if let Some(class_id) = class_id {
-            self.record_initiating_loader(caller_loader, internal_name.to_owned(), class_id);
+            self.record_initiating_loader(initiating_loader, internal_name.to_owned(), class_id);
             Ok(class_id)
         } else {
             self.throw_no_class_def_found(internal_name);
@@ -1700,6 +1716,64 @@ impl Vm {
         let class_id = self.register_defined_class(defining_loader, descriptor.to_owned());
         self.record_initiating_loader(defining_loader, descriptor.to_owned(), class_id);
         Ok(class_id)
+    }
+
+    pub(in crate::interpreter) fn array_descriptor_for_component(component: &str) -> String {
+        if component.starts_with('[') {
+            format!("[{component}")
+        } else {
+            format!("[L{component};")
+        }
+    }
+
+    pub(in crate::interpreter) fn resolve_array_class_for_component(
+        &mut self,
+        component_class_id: ClassId,
+    ) -> Result<ClassId, String> {
+        let component_record = self
+            .class_record(component_class_id)
+            .cloned()
+            .ok_or_else(|| "java/lang/NoClassDefFoundError: invalid array component".to_owned())?;
+        let descriptor = Self::array_descriptor_for_component(&component_record.internal_name);
+        let class_id = self.register_defined_class(component_record.defining_loader, descriptor.clone());
+        self.record_initiating_loader(component_record.defining_loader, descriptor, class_id);
+        Ok(class_id)
+    }
+
+    pub(in crate::interpreter) fn new_object_for_class_id(
+        &mut self,
+        class_id: ClassId,
+    ) -> Result<JRef, String> {
+        let class_name = self
+            .class_record(class_id)
+            .map(|record| record.internal_name.clone())
+            .ok_or_else(|| "java/lang/NoClassDefFoundError: invalid resolved class".to_owned())?;
+        let obj = JObject::new(class_name);
+        self.record_object_class_id(&obj, class_id);
+        Ok(obj)
+    }
+
+    pub(in crate::interpreter) fn new_array_for_class_id(
+        &mut self,
+        class_id: ClassId,
+        elements: Vec<JValue>,
+    ) -> Result<JRef, String> {
+        let class_name = self
+            .class_record(class_id)
+            .map(|record| record.internal_name.clone())
+            .ok_or_else(|| "java/lang/NoClassDefFoundError: invalid array class".to_owned())?;
+        let obj = JObject::new_array(class_name, elements);
+        self.record_object_class_id(&obj, class_id);
+        Ok(obj)
+    }
+
+    pub(in crate::interpreter) fn primitive_array_class_id(
+        &mut self,
+        descriptor: &str,
+    ) -> ClassId {
+        let class_id = self.register_defined_class(LoaderId::BOOTSTRAP, descriptor.to_owned());
+        self.record_initiating_loader(LoaderId::BOOTSTRAP, descriptor.to_owned(), class_id);
+        class_id
     }
 
     /// Look up a loaded class by internal name (triggers lazy parse if needed).
@@ -2051,7 +2125,34 @@ impl Vm {
     }
 
     /// Recursively create a multi-dimensional array for `multianewarray`.
-    fn create_multi_array(&self, desc: &str, sizes: &[usize], depth: usize) -> JRef {
+    pub(in crate::interpreter) fn create_multi_array_for_class_id(
+        &mut self,
+        class_id: ClassId,
+        sizes: &[usize],
+    ) -> Result<JRef, String> {
+        let record = self
+            .class_record(class_id)
+            .cloned()
+            .ok_or_else(|| "java/lang/NoClassDefFoundError: invalid array class".to_owned())?;
+        Ok(self.create_multi_array(&record.internal_name, record.defining_loader, sizes, 0))
+    }
+
+    pub(in crate::interpreter) fn create_multi_array_for_descriptor(
+        &mut self,
+        descriptor: &str,
+        defining_loader: LoaderId,
+        sizes: &[usize],
+    ) -> JRef {
+        self.create_multi_array(descriptor, defining_loader, sizes, 0)
+    }
+
+    fn create_multi_array(
+        &mut self,
+        desc: &str,
+        defining_loader: LoaderId,
+        sizes: &[usize],
+        depth: usize,
+    ) -> JRef {
         let count = sizes[depth];
         if depth + 1 >= sizes.len() {
             let elem = if desc.ends_with("[I") || desc.ends_with("[B") || desc.ends_with("[C") || desc.ends_with("[S") || desc.ends_with("[Z") {
@@ -2065,13 +2166,26 @@ impl Vm {
             } else {
                 JValue::Ref(None)
             };
-            JObject::new_array(desc, vec![elem; count])
+            let obj = JObject::new_array(desc, vec![elem; count]);
+            let class_id = self.register_defined_class(defining_loader, desc.to_owned());
+            self.record_object_class_id(&obj, class_id);
+            obj
         } else {
             let sub_desc = &desc[1..];
             let elements: Vec<JValue> = (0..count)
-                .map(|_| JValue::Ref(Some(self.create_multi_array(sub_desc, sizes, depth + 1))))
+                .map(|_| {
+                    JValue::Ref(Some(self.create_multi_array(
+                        sub_desc,
+                        defining_loader,
+                        sizes,
+                        depth + 1,
+                    )))
+                })
                 .collect();
-            JObject::new_array(desc, elements)
+            let obj = JObject::new_array(desc, elements);
+            let class_id = self.register_defined_class(defining_loader, desc.to_owned());
+            self.record_object_class_id(&obj, class_id);
+            obj
         }
     }
 

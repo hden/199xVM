@@ -24,13 +24,8 @@ impl Vm {
         let exc_class = if err_msg.starts_with("java/") || err_msg.starts_with("javax/") {
             err_msg.split(':').next().unwrap_or(err_msg).trim()
         } else if let Some(rest) = err_msg.strip_prefix("Exception: ") {
-            rest.split(" | ")
-                .next()
-                .unwrap_or(rest)
-                .split(':')
-                .next()
-                .unwrap_or(rest)
-                .trim()
+            let first_failure = rest.split(" | ").next().unwrap_or(rest);
+            first_failure.split(':').next().unwrap_or(first_failure).trim()
         } else if err_msg.starts_with("NullPointerException") {
             "java/lang/NullPointerException"
         } else if err_msg.starts_with("ClassCastException") {
@@ -828,7 +823,7 @@ impl Vm {
                     }
                     let obj = if self.resolve_class_by_id(new_class_id).is_some() {
                         // Class is loaded (bytecode available) — use plain object.
-                        JObject::new(&new_class)
+                        self.new_object_for_class_id(new_class_id)?
                     } else {
                         match new_class.as_str() {
                             // JDK collection types backed by Array payload (no shim loaded).
@@ -846,17 +841,19 @@ impl Vm {
                         return Err(format!("java/lang/NegativeArraySizeException: {count_int}"));
                     }
                     let count = count_int as usize;
-                    let arr = match atype {
-                        4 => JObject::new_array("[Z", vec![JValue::Int(0); count]),   // boolean
-                        5 => JObject::new_array("[C", vec![JValue::Int(0); count]),   // char
-                        6 => JObject::new_array("[F", vec![JValue::Float(0.0); count]), // float
-                        7 => JObject::new_array("[D", vec![JValue::Double(0.0); count]), // double
-                        8 => JObject::new_array("[B", vec![JValue::Int(0); count]),   // byte
-                        9 => JObject::new_array("[S", vec![JValue::Int(0); count]),   // short
-                        10 => JObject::new_array("[I", vec![JValue::Int(0); count]),  // int
-                        11 => JObject::new_array("[J", vec![JValue::Long(0); count]), // long
-                        _ => JObject::new_array("[Ljava/lang/Object;", vec![JValue::Ref(None); count]),
+                    let (descriptor, elements) = match atype {
+                        4 => ("[Z", vec![JValue::Int(0); count]),   // boolean
+                        5 => ("[C", vec![JValue::Int(0); count]),   // char
+                        6 => ("[F", vec![JValue::Float(0.0); count]), // float
+                        7 => ("[D", vec![JValue::Double(0.0); count]), // double
+                        8 => ("[B", vec![JValue::Int(0); count]),   // byte
+                        9 => ("[S", vec![JValue::Int(0); count]),   // short
+                        10 => ("[I", vec![JValue::Int(0); count]),  // int
+                        11 => ("[J", vec![JValue::Long(0); count]), // long
+                        _ => ("[Ljava/lang/Object;", vec![JValue::Ref(None); count]),
                     };
+                    let class_id = self.primitive_array_class_id(descriptor);
+                    let arr = self.new_array_for_class_id(class_id, elements)?;
                     frame.stack.push(JValue::Ref(Some(arr)));
                 }
                 0xbd => { // anewarray
@@ -864,18 +861,18 @@ impl Vm {
                     let caller_class_id = caller_class_id
                         .ok_or_else(|| format!("java/lang/NoClassDefFoundError: missing caller for {class_name}"))?;
                     let elem_class_id = self.resolve_symbolic_class(caller_class_id, cp, idx)?;
-                    let elem_class = self.class_record(elem_class_id)
-                        .map(|record| record.internal_name.clone())
-                        .ok_or_else(|| "java/lang/NoClassDefFoundError: invalid array component".to_owned())?;
+                    let array_class_id = self.resolve_array_class_for_component(
+                        elem_class_id,
+                    )?;
                     let count_int = frame.stack.pop().unwrap().as_int();
                     if count_int < 0 {
                         return Err(format!("java/lang/NegativeArraySizeException: {count_int}"));
                     }
                     let count = count_int as usize;
-                    let arr = JObject::new_array(
-                        format!("[L{elem_class};"),
+                    let arr = self.new_array_for_class_id(
+                        array_class_id,
                         vec![JValue::Ref(None); count],
-                    );
+                    )?;
                     frame.stack.push(JValue::Ref(Some(arr)));
                 }
                 0xc5 => { // multianewarray
@@ -885,9 +882,6 @@ impl Vm {
                     let caller_class_id = caller_class_id
                         .ok_or_else(|| format!("java/lang/NoClassDefFoundError: missing caller for {class_name}"))?;
                     let array_class_id = self.resolve_symbolic_class(caller_class_id, cp, idx)?;
-                    let class_name_str = self.class_record(array_class_id)
-                        .map(|record| record.internal_name.clone())
-                        .ok_or_else(|| "java/lang/NoClassDefFoundError: invalid array class".to_owned())?;
                     let mut dim_sizes = Vec::with_capacity(dimensions);
                     for _ in 0..dimensions {
                         let n = frame.stack.pop().unwrap().as_int();
@@ -897,7 +891,7 @@ impl Vm {
                         dim_sizes.push(n as usize);
                     }
                     dim_sizes.reverse();
-                    let arr = self.create_multi_array(&class_name_str, &dim_sizes, 0);
+                    let arr = self.create_multi_array_for_class_id(array_class_id, &dim_sizes)?;
                     frame.stack.push(JValue::Ref(Some(arr)));
                 }
                 0xbe => { // arraylength
