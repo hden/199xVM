@@ -5,6 +5,7 @@ use crate::class_file::{BootstrapMethod, ConstantPoolEntry};
 use crate::heap::{JavaStringValue, JObject, JRef, JValue, NativePayload};
 
 use super::Vm;
+use super::class_identity::ClassId;
 use super::cp_cache::{CpCache, CpCacheEntry, ResolvedMethodEntry};
 use super::descriptors::*;
 use super::frame::*;
@@ -32,6 +33,7 @@ impl Vm {
         cp: &[ConstantPoolEntry],
         cache: &CpCache,
         idx: u16,
+        caller_class_id: Option<ClassId>,
         frame: &mut Frame,
     ) -> Result<Option<JValue>, String> {
         // ---- FAST PATH: check cpCache for a previously resolved method ----
@@ -62,25 +64,37 @@ impl Vm {
 
         // ---- SLOW PATH: first invocation — resolve and populate cache ----
         let (class_name, method_name, descriptor) = resolve_methodref_ref(cp, idx);
-        self.ensure_class_init(class_name)?;
+        let resolved_class_id = caller_class_id
+            .and_then(|caller| self.resolve_methodref_owner_class(caller, cp, idx).ok());
+        let resolved_class_name = resolved_class_id
+            .and_then(|class_id| self.class_record(class_id).map(|record| record.internal_name.clone()))
+            .unwrap_or_else(|| class_name.to_owned());
+        self.ensure_class_init(&resolved_class_name)?;
         let n_args = count_args(descriptor);
         let args = pop_args(frame, n_args);
 
         // Normalize descriptor and args (varargs synthesis) before branching.
         let orig_args = args.clone();
-        let (desc, args) = match self.prepare_static_args(class_name, method_name, descriptor, args) {
-            Some(pair) => pair,
-            None => {
-                // Method flags not found — fall back to invoke_static with original args.
-                let result = self.invoke_static(class_name, method_name, descriptor, orig_args)?;
-                if !matches!(result, JValue::Void) { frame.stack.push(result); }
-                return Ok(None);
+        let (desc, args) = if resolved_class_id.is_some() {
+            (descriptor.to_owned(), args)
+        } else {
+            match self.prepare_static_args(&resolved_class_name, method_name, descriptor, args) {
+                Some(pair) => pair,
+                None => {
+                    // Method flags not found — fall back to invoke_static with original args.
+                    let result = self.invoke_static(&resolved_class_name, method_name, descriptor, orig_args)?;
+                    if !matches!(result, JValue::Void) { frame.stack.push(result); }
+                    return Ok(None);
+                }
             }
         };
 
         let push_return = !desc.ends_with(")V");
         // Resolve method exec info once (used for both frame building and cache population).
-        match self.resolve_method_exec_info(class_name, method_name, &desc) {
+        let exec_info = resolved_class_id
+            .and_then(|class_id| self.resolve_method_exec_info_for_class_id(class_id, method_name, &desc))
+            .or_else(|| self.resolve_method_exec_info(&resolved_class_name, method_name, &desc));
+        match exec_info {
             Some(info) if info.has_code => {
                 // Bytecode method — build frame and populate cache.
                 let fi = self.build_static_frame_from_exec_info(&info, method_name, &desc, args, push_return);
@@ -90,8 +104,8 @@ impl Vm {
             }
             _ => {
                 // Native or unresolved — cache and fall back to invoke_static.
-                self.populate_static_native_cache(cache, idx, class_name, method_name, &desc);
-                let result = self.invoke_static(class_name, method_name, &desc, args)?;
+                self.populate_static_native_cache(cache, idx, &resolved_class_name, method_name, &desc);
+                let result = self.invoke_static(&resolved_class_name, method_name, &desc, args)?;
                 if !matches!(result, JValue::Void) {
                     frame.stack.push(result);
                 }
@@ -100,8 +114,22 @@ impl Vm {
         }
     }
 
+    fn resolve_methodref_owner_class(
+        &mut self,
+        caller_class_id: ClassId,
+        cp: &[ConstantPoolEntry],
+        idx: u16,
+    ) -> Result<ClassId, String> {
+        let class_index = match cp.get(idx as usize) {
+            Some(ConstantPoolEntry::Methodref { class_index, .. })
+            | Some(ConstantPoolEntry::InterfaceMethodref { class_index, .. }) => *class_index,
+            _ => return Err(format!("java/lang/NoClassDefFoundError: invalid method reference #{idx}")),
+        };
+        self.resolve_symbolic_class(caller_class_id, cp, class_index)
+    }
+
     /// Build a FrameInfo from a pre-resolved MethodExecInfo (avoids double resolution).
-    fn build_static_frame_from_exec_info(
+    pub(super) fn build_static_frame_from_exec_info(
         &mut self,
         info: &super::MethodExecInfo,
         method_name: &str,
@@ -129,6 +157,7 @@ impl Vm {
             None
         };
         FrameInfo {
+            class_id: info.class_id,
             frame: Frame { locals, stack: Vec::new(), pc: 0 },
             code: info.code.clone(),
             cp: Rc::clone(&info.cp),
@@ -164,6 +193,7 @@ impl Vm {
             None
         };
         FrameInfo {
+            class_id: entry.owner_class_id,
             frame: Frame { locals, stack: Vec::new(), pc: 0 },
             code: (*entry.code).clone(),
             cp: Rc::clone(&entry.cp),
@@ -189,6 +219,7 @@ impl Vm {
     ) {
         let (param_tokens, _) = Self::parse_method_descriptor_tokens(descriptor);
         let entry = ResolvedMethodEntry {
+            owner_class_id: info.class_id,
             owner_class: info.class_name.clone(),
             code: Rc::new(info.code.clone()),
             exception_table: Rc::new(info.exception_table.clone()),
@@ -219,6 +250,7 @@ impl Vm {
     ) {
         let (param_tokens, _) = Self::parse_method_descriptor_tokens(descriptor);
         let entry = ResolvedMethodEntry {
+            owner_class_id: None,
             owner_class: class_name.to_owned(),
             code: Rc::new(Vec::new()),
             exception_table: Rc::new(Vec::new()),
@@ -321,6 +353,11 @@ impl Vm {
                 // WaitingOnCondition) won't cause a yield. This is acceptable
                 // because Rust closures don't call Java wait/notify.
                 let result = self.invoke_virtual(r, class_name, method_name, descriptor, args)?;
+                if class_name == "java/lang/reflect/Method" && method_name == "invoke" {
+                    if let Some(err) = self.pending_exception_err() {
+                        return Err(err);
+                    }
+                }
                 if !matches!(result, JValue::Void) {
                     frame.stack.push(result);
                 }

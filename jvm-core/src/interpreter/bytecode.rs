@@ -2,6 +2,7 @@
 use crate::class_file::{BootstrapMethod, ConstantPoolEntry, ExceptionTableEntry};
 use crate::heap::{JObject, JValue, NativePayload};
 
+use super::class_identity::ClassId;
 use super::Vm;
 use super::cp_cache::{CpCache, CpCacheEntry, ResolvedFieldEntry};
 use super::descriptors::*;
@@ -23,7 +24,13 @@ impl Vm {
         let exc_class = if err_msg.starts_with("java/") || err_msg.starts_with("javax/") {
             err_msg.split(':').next().unwrap_or(err_msg).trim()
         } else if let Some(rest) = err_msg.strip_prefix("Exception: ") {
-            rest.split(':').next().unwrap_or(rest).trim()
+            rest.split(" | ")
+                .next()
+                .unwrap_or(rest)
+                .split(':')
+                .next()
+                .unwrap_or(rest)
+                .trim()
         } else if err_msg.starts_with("NullPointerException") {
             "java/lang/NullPointerException"
         } else if err_msg.starts_with("ClassCastException") {
@@ -95,6 +102,7 @@ impl Vm {
         cp: &[ConstantPoolEntry],
         cache: &CpCache,
         class_name: &str,
+        caller_class_id: Option<ClassId>,
         bootstrap_methods: &[BootstrapMethod],
         _exception_table: &[ExceptionTableEntry],
         opcode: u8,
@@ -131,12 +139,12 @@ impl Vm {
                 0x12 => { // ldc
                     let idx = code[frame.pc] as u16;
                     frame.pc += 1;
-                    self.push_ldc(frame, cp, idx);
+                    self.push_ldc(frame, cp, caller_class_id, idx)?;
                 }
                 0x13 | 0x14 => { // ldc_w / ldc2_w
                     let idx = u16::from_be_bytes([code[frame.pc], code[frame.pc + 1]]);
                     frame.pc += 2;
-                    self.push_ldc(frame, cp, idx);
+                    self.push_ldc(frame, cp, caller_class_id, idx)?;
                 }
 
                 // ---- Loads ----
@@ -783,7 +791,7 @@ impl Vm {
                 }
                 0xb8 => { // invokestatic
                     let idx = read_u16(code, &mut frame.pc);
-                    self.dispatch_static(cp, cache, idx, frame)?;
+                    self.dispatch_static(cp, cache, idx, caller_class_id, frame)?;
                 }
                 0xb9 => { // invokeinterface
                     let idx = read_u16(code, &mut frame.pc);
@@ -802,24 +810,31 @@ impl Vm {
                 // ---- Object creation ----
                 0xbb => { // new
                     let idx = read_u16(code, &mut frame.pc);
-                    let new_class = resolve_class_name_ref(cp, idx);
+                    let caller_class_id = caller_class_id
+                        .ok_or_else(|| format!("java/lang/NoClassDefFoundError: missing caller for {class_name}"))?;
+                    let new_class_id = self.resolve_symbolic_class(caller_class_id, cp, idx)?;
+                    let new_class = self.class_record(new_class_id)
+                        .map(|record| record.internal_name.clone())
+                        .ok_or_else(|| "java/lang/NoClassDefFoundError: invalid resolved class".to_owned())?;
                     // Run <clinit> for the class being instantiated.
-                    self.ensure_class_init(new_class)?;
+                    self.ensure_class_init(&new_class)?;
                     // A ParseError entry means the class was registered but malformed —
                     // surface consistently as ClassFormatError (same as Class.forName0 path).
-                    if matches!(self.classes.get(new_class), Some(super::LazyClass::ParseError(_))) {
-                        self.throw_class_format_error(new_class);
+                    if matches!(self.classes_by_id.get(&new_class_id), Some(super::LazyClass::ParseError(_)))
+                        || matches!(self.classes.get(&new_class), Some(super::LazyClass::ParseError(_)))
+                    {
+                        self.throw_class_format_error(&new_class);
                         return Err(format!("java/lang/ClassFormatError: malformed class file for {new_class}"));
                     }
-                    let obj = if self.get_class(new_class).is_some() {
+                    let obj = if self.resolve_class_by_id(new_class_id).is_some() {
                         // Class is loaded (bytecode available) — use plain object.
-                        JObject::new(new_class)
+                        JObject::new(&new_class)
                     } else {
-                        match new_class {
+                        match new_class.as_str() {
                             // JDK collection types backed by Array payload (no shim loaded).
                             "java/util/ArrayList" | "java/util/LinkedList" =>
                                 JObject::new_array(new_class, vec![]),
-                            _ => JObject::new(new_class),
+                            _ => JObject::new(&new_class),
                         }
                     };
                     frame.stack.push(JValue::Ref(Some(obj)));
@@ -846,7 +861,12 @@ impl Vm {
                 }
                 0xbd => { // anewarray
                     let idx = read_u16(code, &mut frame.pc);
-                    let elem_class = resolve_class_name_ref(cp, idx);
+                    let caller_class_id = caller_class_id
+                        .ok_or_else(|| format!("java/lang/NoClassDefFoundError: missing caller for {class_name}"))?;
+                    let elem_class_id = self.resolve_symbolic_class(caller_class_id, cp, idx)?;
+                    let elem_class = self.class_record(elem_class_id)
+                        .map(|record| record.internal_name.clone())
+                        .ok_or_else(|| "java/lang/NoClassDefFoundError: invalid array component".to_owned())?;
                     let count_int = frame.stack.pop().unwrap().as_int();
                     if count_int < 0 {
                         return Err(format!("java/lang/NegativeArraySizeException: {count_int}"));
@@ -862,7 +882,12 @@ impl Vm {
                     let idx = read_u16(code, &mut frame.pc);
                     let dimensions = code[frame.pc] as usize;
                     frame.pc += 1;
-                    let class_name_str = resolve_class_name_ref(cp, idx);
+                    let caller_class_id = caller_class_id
+                        .ok_or_else(|| format!("java/lang/NoClassDefFoundError: missing caller for {class_name}"))?;
+                    let array_class_id = self.resolve_symbolic_class(caller_class_id, cp, idx)?;
+                    let class_name_str = self.class_record(array_class_id)
+                        .map(|record| record.internal_name.clone())
+                        .ok_or_else(|| "java/lang/NoClassDefFoundError: invalid array class".to_owned())?;
                     let mut dim_sizes = Vec::with_capacity(dimensions);
                     for _ in 0..dimensions {
                         let n = frame.stack.pop().unwrap().as_int();
@@ -872,7 +897,7 @@ impl Vm {
                         dim_sizes.push(n as usize);
                     }
                     dim_sizes.reverse();
-                    let arr = self.create_multi_array(class_name_str, &dim_sizes, 0);
+                    let arr = self.create_multi_array(&class_name_str, &dim_sizes, 0);
                     frame.stack.push(JValue::Ref(Some(arr)));
                 }
                 0xbe => { // arraylength
@@ -893,7 +918,12 @@ impl Vm {
                 // ---- instanceof / checkcast ----
                 0xc0 => { // checkcast — per JVMS §6.5.checkcast
                     let idx = read_u16(code, &mut frame.pc);
-                    let target_class = resolve_class_name_ref(cp, idx);
+                    let caller_class_id = caller_class_id
+                        .ok_or_else(|| format!("java/lang/NoClassDefFoundError: missing caller for {class_name}"))?;
+                    let target_class_id = self.resolve_symbolic_class(caller_class_id, cp, idx)?;
+                    let target_class = self.class_record(target_class_id)
+                        .map(|record| record.internal_name.clone())
+                        .ok_or_else(|| "java/lang/NoClassDefFoundError: invalid checkcast target".to_owned())?;
                     // Peek at top of stack (don't pop — value stays if check passes).
                     let obj = frame.stack.last()
                         .ok_or_else(|| "checkcast: empty stack".to_owned())?;
@@ -901,7 +931,7 @@ impl Vm {
                         None => {} // null passes checkcast
                         Some(r) => {
                             let cn = r.borrow().class_name.clone();
-                            if !self.is_instance_of(&cn, target_class) {
+                            if !self.is_instance_of(&cn, &target_class) {
                                 return Err(format!(
                                     "ClassCastException: {} cannot be cast to {}",
                                     cn.replace('/', "."),
@@ -913,13 +943,18 @@ impl Vm {
                 }
                 0xc1 => { // instanceof
                     let idx = read_u16(code, &mut frame.pc);
-                    let target_class = resolve_class_name_ref(cp, idx);
+                    let caller_class_id = caller_class_id
+                        .ok_or_else(|| format!("java/lang/NoClassDefFoundError: missing caller for {class_name}"))?;
+                    let target_class_id = self.resolve_symbolic_class(caller_class_id, cp, idx)?;
+                    let target_class = self.class_record(target_class_id)
+                        .map(|record| record.internal_name.clone())
+                        .ok_or_else(|| "java/lang/NoClassDefFoundError: invalid instanceof target".to_owned())?;
                     let obj = frame.stack.pop().unwrap();
                     let is_instance = match obj.as_ref() {
                         None => false,
                         Some(r) => {
                             let cn = r.borrow().class_name.clone();
-                            self.is_instance_of(&cn, target_class)
+                            self.is_instance_of(&cn, &target_class)
                         }
                     };
                     frame.stack.push(JValue::Int(is_instance as i32));
@@ -1014,7 +1049,13 @@ impl Vm {
     // Opcode helpers
     // ------------------------------------------------------------------
 
-    fn push_ldc(&mut self, frame: &mut Frame, cp: &[ConstantPoolEntry], idx: u16) {
+    fn push_ldc(
+        &mut self,
+        frame: &mut Frame,
+        cp: &[ConstantPoolEntry],
+        caller_class_id: Option<ClassId>,
+        idx: u16,
+    ) -> Result<(), String> {
         match &cp[idx as usize] {
             ConstantPoolEntry::Integer(v) => frame.stack.push(JValue::Int(*v)),
             ConstantPoolEntry::Float(v) => frame.stack.push(JValue::Float(*v)),
@@ -1028,12 +1069,12 @@ impl Vm {
                 let obj = self.intern_string(s);
                 frame.stack.push(JValue::Ref(Some(obj)));
             }
-            ConstantPoolEntry::Class { name_index } => {
-                let name = match &cp[*name_index as usize] {
-                    ConstantPoolEntry::Utf8(s) => s.as_str(),
-                    _ => "",
-                };
-                let obj = self.class_object(name);
+            ConstantPoolEntry::Class { .. } => {
+                let caller_class_id = caller_class_id
+                    .ok_or_else(|| "java/lang/NoClassDefFoundError: missing caller for ldc Class".to_owned())?;
+                let class_id = self.resolve_symbolic_class(caller_class_id, cp, idx)?;
+                let obj = self.class_object_for_id(class_id)
+                    .ok_or_else(|| "java/lang/NoClassDefFoundError: invalid ldc Class mirror".to_owned())?;
                 frame.stack.push(JValue::Ref(Some(obj)));
             }
             _other => {
@@ -1041,6 +1082,7 @@ impl Vm {
                 frame.stack.push(JValue::Ref(None));
             }
         }
+        Ok(())
     }
 
     fn resolve_static_field(

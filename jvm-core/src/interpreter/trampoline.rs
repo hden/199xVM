@@ -4,6 +4,7 @@ use crate::class_file::{BootstrapMethod, ConstantPoolEntry, ExceptionTableEntry}
 use crate::heap::{JObject, JRef, JValue};
 
 use super::cp_cache::CpCache;
+use super::class_identity::ClassId;
 use super::descriptors::*;
 use super::frame::*;
 use super::Vm;
@@ -14,6 +15,7 @@ use super::Vm;
 
 /// All data needed to execute or resume a method frame.
 pub(crate) struct FrameInfo {
+    pub class_id: Option<ClassId>,
     pub frame: Frame,
     pub code: Vec<u8>,
     pub cp: Rc<Vec<ConstantPoolEntry>>,
@@ -87,7 +89,7 @@ impl Vm {
 
             let result = self.execute_opcode(
                 &mut fi.frame, &fi.code, &fi.cp, &fi.cache, &fi.frame_owner,
-                &fi.bootstrap_methods, &fi.exception_table, opcode,
+                fi.class_id, &fi.bootstrap_methods, &fi.exception_table, opcode,
             );
 
             match result {
@@ -169,7 +171,7 @@ impl Vm {
 
             let result = self.execute_opcode(
                 &mut fi.frame, &fi.code, &fi.cp, &fi.cache, &fi.frame_owner,
-                &fi.bootstrap_methods, &fi.exception_table, opcode,
+                fi.class_id, &fi.bootstrap_methods, &fi.exception_table, opcode,
             );
 
             match result {
@@ -596,6 +598,7 @@ impl Vm {
             None
         };
         Ok(Some(FrameInfo {
+            class_id: info.class_id,
             frame: Frame { locals, stack: Vec::new(), pc: 0 },
             code: info.code, cp: info.cp, cache: info.cache, frame_owner: fo,
             bootstrap_methods: info.bootstrap_methods, exception_table: info.exception_table,
@@ -679,6 +682,7 @@ impl Vm {
         let fo = format!("{}.{method_name}{}", info.class_name, info.descriptor);
         let synchronized_monitor = self.acquire_instance_synchronized_monitor(info.access_flags, &locals);
         Ok(Some(FrameInfo {
+            class_id: info.class_id,
             frame: Frame { locals, stack: Vec::new(), pc: 0 },
             code: info.code, cp: info.cp, cache: info.cache, frame_owner: fo,
             bootstrap_methods: info.bootstrap_methods, exception_table: info.exception_table,
@@ -735,6 +739,7 @@ impl Vm {
         let fo = format!("{}.{method_name}{}", info.class_name, info.descriptor);
         let synchronized_monitor = self.acquire_instance_synchronized_monitor(info.access_flags, &locals);
         Ok(Some(FrameInfo {
+            class_id: info.class_id,
             frame: Frame { locals, stack: Vec::new(), pc: 0 },
             code: info.code, cp: info.cp, cache: info.cache, frame_owner: fo,
             bootstrap_methods: info.bootstrap_methods, exception_table: info.exception_table,

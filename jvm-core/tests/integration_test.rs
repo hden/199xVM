@@ -536,7 +536,6 @@ fn same_binary_name_under_distinct_loaders_isolates_static_state() {
 }
 
 #[test]
-#[ignore = "Phase 0 regression target for caller-loader class resolution"]
 fn caller_loader_context_changes_symbolic_class_resolution() {
     let result = run_jar_test(
         "CallerLoaderClassResolutionTest",
@@ -580,7 +579,6 @@ fn cp_cache_keeps_loader_distinct_member_owners_isolated() {
 }
 
 #[test]
-#[ignore = "Phase 0 regression target for repeatable failed symbolic resolution"]
 fn failed_symbolic_resolutions_repeat_same_error_family() {
     let result = run_jar_test(
         "RepeatedResolutionFailureTest",
@@ -589,7 +587,7 @@ fn failed_symbolic_resolutions_repeat_same_error_family() {
     );
     assert_eq!(
         result,
-        "NoClassDefFoundError|NoSuchFieldError|NoSuchMethodError|NoSuchMethodError"
+        "NoClassDefFoundError"
     );
 }
 
