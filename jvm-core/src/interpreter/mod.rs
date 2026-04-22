@@ -26,6 +26,8 @@ type OwnedJarArchive = zip::ZipArchive<std::io::Cursor<Vec<u8>>>;
 /// Returned by [`Vm::resolve_method_exec_info`] to avoid repeated `find_method`
 /// calls and to give each field a self-documenting name.
 pub(super) struct MethodExecInfo {
+    /// Loader-scoped class identity that owns the resolved method.
+    pub class_id: Option<ClassId>,
     /// Internal class name that owns the resolved method.
     pub class_name: String,
     /// Resolved method descriptor (may differ from the call-site descriptor for generics).
@@ -521,6 +523,9 @@ pub struct Vm {
     /// Entries start as `LazyClass::PendingBytes`/`PendingJarEntry` and are promoted to
     /// `LazyClass::Ready` (parsed `ClassFile`) on first access.
     pub(in crate::interpreter) classes: HashMap<String, LazyClass>,
+    /// Loader-scoped bytecode storage for classes whose plain binary name is not
+    /// enough to identify the defining class.
+    pub(in crate::interpreter) classes_by_id: HashMap<ClassId, LazyClass>,
     /// Loader-owned class identity records for defining and initiating loaders.
     class_identities: ClassIdentityRegistry,
     /// Java ClassLoader object identity to VM LoaderId side table.
@@ -584,6 +589,7 @@ impl Vm {
     pub fn new() -> Self {
         Vm {
             classes: HashMap::new(),
+            classes_by_id: HashMap::new(),
             class_identities: ClassIdentityRegistry::new(),
             classloader_ids: HashMap::new(),
             classloader_objects: HashMap::new(),
@@ -1081,6 +1087,9 @@ impl Vm {
     ) -> ClassId {
         let class_id = self.register_defined_class(defining_loader, name.clone());
         self.record_initiating_loader(defining_loader, name.clone(), class_id);
+        self.classes_by_id
+            .entry(class_id)
+            .or_insert_with(|| LazyClass::PendingBytes(bytes.clone()));
         self.classes.entry(name).or_insert(LazyClass::PendingBytes(bytes));
         class_id
     }
@@ -1088,6 +1097,9 @@ impl Vm {
     fn load_lazy_jar_entry(&mut self, name: String, entry: JarEntryRef) {
         let class_id = self.register_defined_class(LoaderId::SYSTEM, name.clone());
         self.record_initiating_loader(LoaderId::SYSTEM, name.clone(), class_id);
+        self.classes_by_id
+            .entry(class_id)
+            .or_insert_with(|| LazyClass::PendingJarEntry(entry.clone()));
         self.classes.entry(name).or_insert(LazyClass::PendingJarEntry(entry));
     }
 
@@ -1216,6 +1228,74 @@ impl Vm {
     pub(in crate::interpreter) fn resolve_class(&mut self, name: &str) -> Option<&ClassFile> {
         self.ensure_class_ready(name);
         self.get_class(name)
+    }
+
+    pub(in crate::interpreter) fn ensure_class_ready_by_id(&mut self, class_id: ClassId) {
+        if !matches!(
+            self.classes_by_id.get(&class_id),
+            Some(LazyClass::PendingBytes(_) | LazyClass::PendingJarEntry(_))
+        ) {
+            return;
+        }
+        let pending = self.classes_by_id.remove(&class_id);
+        let expected_name = self
+            .class_record(class_id)
+            .map(|record| record.internal_name.clone())
+            .unwrap_or_default();
+        let result = match pending {
+            Some(LazyClass::PendingBytes(bytes)) => class_file::parse(&bytes).map_err(|e| e.to_string()),
+            Some(LazyClass::PendingJarEntry(entry)) => match self.read_jar_entry(&entry) {
+                Ok(bytes) => match class_file::parse(&bytes) {
+                    Ok(cf) => {
+                        let actual_name = cf.constant_pool.class_name(cf.this_class);
+                        if actual_name == expected_name {
+                            Ok(cf)
+                        } else {
+                            Err(format!(
+                                "Class name mismatch for {}: expected {}, found {}",
+                                entry.entry_name, expected_name, actual_name
+                            ))
+                        }
+                    }
+                    Err(e) => Err(e.to_string()),
+                },
+                Err(e) => Err(e),
+            },
+            Some(other) => {
+                self.classes_by_id.insert(class_id, other);
+                return;
+            }
+            None => return,
+        };
+        match result {
+            Ok(cf) => {
+                self.classes_by_id.insert(class_id, LazyClass::Ready(cf));
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to parse class '{expected_name}': {e}");
+                self.classes_by_id.insert(class_id, LazyClass::ParseError(e));
+            }
+        }
+    }
+
+    pub(in crate::interpreter) fn get_class_by_id(&self, class_id: ClassId) -> Option<&ClassFile> {
+        if let Some(entry) = self.classes_by_id.get(&class_id) {
+            return match entry {
+                LazyClass::Ready(cf) => Some(cf),
+                LazyClass::PendingBytes(_) | LazyClass::PendingJarEntry(_) | LazyClass::ParseError(_) => None,
+            };
+        }
+        let name = &self.class_record(class_id)?.internal_name;
+        self.get_class(name)
+    }
+
+    pub(in crate::interpreter) fn resolve_class_by_id(&mut self, class_id: ClassId) -> Option<&ClassFile> {
+        self.ensure_class_ready_by_id(class_id);
+        if self.classes_by_id.contains_key(&class_id) {
+            return self.get_class_by_id(class_id);
+        }
+        let name = self.class_record(class_id)?.internal_name.clone();
+        self.resolve_class(&name)
     }
 
     /// Flush buffered PrintStream output (`print` without trailing `println`).
@@ -1382,7 +1462,7 @@ impl Vm {
         format_exception_chain(r, &mut Vec::new(), 0)
     }
 
-    fn pending_exception_err(&self) -> Option<String> {
+    pub(in crate::interpreter) fn pending_exception_err(&self) -> Option<String> {
         self.scheduler.current_thread().pending_exception.as_ref().map(|r| self.format_exception_ref(r))
     }
 
@@ -1509,6 +1589,119 @@ impl Vm {
         Some(obj)
     }
 
+    pub(crate) fn class_id_from_class_object(&self, class_object: &JRef) -> Option<ClassId> {
+        self.class_pool.iter().find_map(|(class_id, existing)| {
+            if Rc::ptr_eq(existing, class_object) {
+                Some(*class_id)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub(crate) fn resolve_symbolic_class(
+        &mut self,
+        caller_class_id: ClassId,
+        cp: &[ConstantPoolEntry],
+        idx: u16,
+    ) -> Result<ClassId, String> {
+        let name = match cp.get(idx as usize) {
+            Some(ConstantPoolEntry::Class { name_index }) => match cp.get(*name_index as usize) {
+                Some(ConstantPoolEntry::Utf8(name)) => name.clone(),
+                _ => return Err(format!("java/lang/NoClassDefFoundError: invalid class reference #{idx}")),
+            },
+            _ => return Err(format!("java/lang/NoClassDefFoundError: invalid class reference #{idx}")),
+        };
+        self.resolve_symbolic_class_name(caller_class_id, &name)
+    }
+
+    pub(crate) fn resolve_symbolic_class_name(
+        &mut self,
+        caller_class_id: ClassId,
+        internal_name: &str,
+    ) -> Result<ClassId, String> {
+        if internal_name.starts_with('[') {
+            return self.resolve_array_class(caller_class_id, internal_name);
+        }
+
+        let caller_loader = self
+            .class_record(caller_class_id)
+            .map(|record| record.defining_loader)
+            .unwrap_or(LoaderId::SYSTEM);
+        if let Some(class_id) = self.class_id_for_initiating(caller_loader, internal_name) {
+            return Ok(class_id);
+        }
+
+        if let Some(loader_object) = self.classloader_objects.get(&caller_loader).cloned() {
+            let binary_name_ref = self.intern_string(internal_name.replace('/', "."));
+            let loader_class_name = loader_object.borrow().class_name.clone();
+            match self.invoke_virtual(
+                loader_object,
+                &loader_class_name,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                vec![JValue::Ref(Some(binary_name_ref))],
+            ) {
+                Ok(JValue::Ref(Some(class_object))) => {
+                    if let Some(class_id) = self.class_id_from_class_object(&class_object) {
+                        self.record_initiating_loader(caller_loader, internal_name.to_owned(), class_id);
+                        return Ok(class_id);
+                    }
+                }
+                Ok(_) | Err(_) => {}
+            }
+            self.throw_no_class_def_found(internal_name);
+            return Err(format!("java/lang/NoClassDefFoundError: {internal_name}"));
+        }
+
+        self.ensure_class_ready(internal_name);
+        if matches!(self.classes.get(internal_name), Some(LazyClass::ParseError(_))) {
+            self.throw_class_format_error(internal_name);
+            return Err(format!("java/lang/ClassFormatError: malformed class file for {internal_name}"));
+        }
+        let class_id = self
+            .class_id_for_defined(caller_loader, internal_name)
+            .or_else(|| self.class_id_for_defined(LoaderId::SYSTEM, internal_name))
+            .or_else(|| self.class_id_for_defined(LoaderId::BOOTSTRAP, internal_name));
+        if let Some(class_id) = class_id {
+            self.record_initiating_loader(caller_loader, internal_name.to_owned(), class_id);
+            Ok(class_id)
+        } else {
+            self.throw_no_class_def_found(internal_name);
+            Err(format!("java/lang/NoClassDefFoundError: {internal_name}"))
+        }
+    }
+
+    fn resolve_array_class(
+        &mut self,
+        caller_class_id: ClassId,
+        descriptor: &str,
+    ) -> Result<ClassId, String> {
+        let defining_loader = match descriptor.as_bytes().get(1).copied() {
+            Some(b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D') => LoaderId::BOOTSTRAP,
+            Some(b'L') => {
+                let component = descriptor
+                    .strip_prefix("[L")
+                    .and_then(|s| s.strip_suffix(';'))
+                    .ok_or_else(|| format!("java/lang/NoClassDefFoundError: {descriptor}"))?;
+                let component_id = self.resolve_symbolic_class_name(caller_class_id, component)?;
+                self.class_record(component_id)
+                    .map(|record| record.defining_loader)
+                    .unwrap_or(LoaderId::SYSTEM)
+            }
+            Some(b'[') => {
+                let component_id = self.resolve_array_class(caller_class_id, &descriptor[1..])?;
+                self.class_record(component_id)
+                    .map(|record| record.defining_loader)
+                    .unwrap_or(LoaderId::BOOTSTRAP)
+            }
+            _ => return Err(format!("java/lang/NoClassDefFoundError: {descriptor}")),
+        };
+        let class_id = self.register_defined_class(defining_loader, descriptor.to_owned());
+        self.record_initiating_loader(defining_loader, descriptor.to_owned(), class_id);
+        Ok(class_id)
+    }
+
     /// Look up a loaded class by internal name (triggers lazy parse if needed).
     pub fn class(&mut self, name: &str) -> Option<&ClassFile> {
         self.resolve_class(name)
@@ -1591,7 +1784,52 @@ impl Vm {
         let bootstrap_methods = class.attributes.iter().find_map(|a| {
             if let Attribute::BootstrapMethods(bms) = a { Some(bms.clone()) } else { None }
         }).unwrap_or_default();
+        let class_id = self
+            .class_id_for_defined(LoaderId::SYSTEM, &class_name_out)
+            .or_else(|| self.class_id_for_defined(LoaderId::BOOTSTRAP, &class_name_out));
         Some(MethodExecInfo {
+            class_id,
+            class_name: class_name_out,
+            descriptor: descriptor_out,
+            access_flags,
+            max_locals,
+            has_code,
+            code,
+            exception_table,
+            cp,
+            cache,
+            bootstrap_methods,
+        })
+    }
+
+    pub(super) fn resolve_method_exec_info_for_class_id(
+        &mut self,
+        class_id: ClassId,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<MethodExecInfo> {
+        self.ensure_class_ready_by_id(class_id);
+        let class = self.get_class_by_id(class_id)?;
+        let method_idx = class.methods.iter().position(|m| {
+            class.constant_pool.utf8(m.name_index) == method_name
+                && class.constant_pool.utf8(m.descriptor_index) == descriptor
+        })?;
+        let class_name_out = class.constant_pool.class_name(class.this_class).to_owned();
+        let descriptor_out = class.constant_pool.utf8(class.methods[method_idx].descriptor_index).to_owned();
+        let access_flags = class.methods[method_idx].access_flags;
+        let (max_locals, has_code, code, exception_table) =
+            if let Some(ca) = class.methods[method_idx].code() {
+                (ca.max_locals as usize, true, ca.code.clone(), ca.exception_table.clone())
+            } else {
+                (0, false, vec![], vec![])
+            };
+        let cp = Rc::clone(&class.constant_pool.entries);
+        let cache = Rc::clone(&class.constant_pool.cache);
+        let bootstrap_methods = class.attributes.iter().find_map(|a| {
+            if let Attribute::BootstrapMethods(bms) = a { Some(bms.clone()) } else { None }
+        }).unwrap_or_default();
+        Some(MethodExecInfo {
+            class_id: Some(class_id),
             class_name: class_name_out,
             descriptor: descriptor_out,
             access_flags,
