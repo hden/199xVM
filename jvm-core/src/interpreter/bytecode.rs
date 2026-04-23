@@ -3,7 +3,7 @@ use crate::class_file::{BootstrapMethod, ConstantPoolEntry, ExceptionTableEntry}
 use crate::heap::{JObject, JValue, NativePayload};
 
 use super::class_identity::ClassId;
-use super::Vm;
+use super::{ResolvedFieldTarget, Vm};
 use super::cp_cache::{CpCache, CpCacheEntry, ResolvedFieldEntry};
 use super::descriptors::*;
 use super::frame::*;
@@ -684,7 +684,10 @@ impl Vm {
                     let cached_val = {
                         let cb = cache.borrow();
                         if let Some(Some(CpCacheEntry::Field(e))) = cb.get(idx as usize) {
-                            let v = self.static_fields.get(&e.owner_class)
+                            let owner = self.class_record(e.owner_class_id)
+                                .map(|record| record.internal_name.as_str())
+                                .unwrap_or(e.owner_class.as_str());
+                            let v = self.static_fields.get(owner)
                                 .and_then(|m| m.get(&e.field_name))
                                 .cloned()
                                 .unwrap_or_else(|| default_value_for_descriptor(&e.field_descriptor));
@@ -696,18 +699,23 @@ impl Vm {
                     if let Some(v) = cached_val {
                         frame.stack.push(v);
                     } else {
-                        // Slow path: resolve, push, then populate cache.
-                        let v = self.resolve_static_field(cp, idx)?;
-                        frame.stack.push(v.clone());
-                        // Populate cache with the resolved field owner.
-                        let (cn, fn_, fd) = resolve_fieldref_ref(cp, idx);
-                        let owner = self.find_static_field_owner_class(cn, fn_)
-                            .unwrap_or_else(|| cn.to_owned());
+                        let caller_class_id = caller_class_id
+                            .ok_or_else(|| "java/lang/NoClassDefFoundError: missing caller for getstatic".to_owned())?;
+                        let target = self.resolve_field_reference(caller_class_id, cp, idx)?;
+                        if target.access_flags & 0x0008 == 0 {
+                            let detail = format!("getstatic {}.{}:{}", target.owner_class, target.name, target.descriptor);
+                            self.throw_incompatible_class_change_error(&detail);
+                            return Err(format!("java/lang/IncompatibleClassChangeError: {detail}"));
+                        }
+                        self.ensure_class_init(&target.owner_class)?;
+                        let v = self.read_static_field_target(&target);
+                        frame.stack.push(v);
                         cache.borrow_mut()[idx as usize] = Some(CpCacheEntry::Field(
                             ResolvedFieldEntry {
-                                owner_class: owner,
-                                field_name: fn_.to_owned(),
-                                field_descriptor: fd.to_owned(),
+                                owner_class_id: target.owner_class_id,
+                                owner_class: target.owner_class,
+                                field_name: target.name,
+                                field_descriptor: target.descriptor,
                             }
                         ));
                     }
@@ -728,16 +736,22 @@ impl Vm {
                     if let Some((owner, field)) = cached {
                         self.static_fields.entry(owner).or_default().insert(field, val);
                     } else {
-                        // Slow path.
-                        let (cls, fld, fd) = resolve_fieldref_ref(cp, idx);
-                        self.ensure_class_init(cls)?;
-                        self.static_fields.entry(cls.to_owned()).or_default().insert(fld.to_owned(), val);
-                        // Populate cache.
+                        let caller_class_id = caller_class_id
+                            .ok_or_else(|| "java/lang/NoClassDefFoundError: missing caller for putstatic".to_owned())?;
+                        let target = self.resolve_field_reference(caller_class_id, cp, idx)?;
+                        if target.access_flags & 0x0008 == 0 {
+                            let detail = format!("putstatic {}.{}:{}", target.owner_class, target.name, target.descriptor);
+                            self.throw_incompatible_class_change_error(&detail);
+                            return Err(format!("java/lang/IncompatibleClassChangeError: {detail}"));
+                        }
+                        self.ensure_class_init(&target.owner_class)?;
+                        self.write_static_field_target(&target, val);
                         cache.borrow_mut()[idx as usize] = Some(CpCacheEntry::Field(
                             ResolvedFieldEntry {
-                                owner_class: cls.to_owned(),
-                                field_name: fld.to_owned(),
-                                field_descriptor: fd.to_owned(),
+                                owner_class_id: target.owner_class_id,
+                                owner_class: target.owner_class,
+                                field_name: target.name,
+                                field_descriptor: target.descriptor,
                             }
                         ));
                     }
@@ -780,7 +794,7 @@ impl Vm {
                 }
                 0xb7 => { // invokespecial
                     let idx = read_u16(code, &mut frame.pc);
-                    self.dispatch_special(cp, idx, frame).map_err(|e| {
+                    self.dispatch_special(cp, idx, caller_class_id, frame).map_err(|e| {
                         if e.starts_with("NullPointerException") { format!("{e} in {class_name}") } else { e }
                     })?;
                 }
@@ -791,7 +805,7 @@ impl Vm {
                 0xb9 => { // invokeinterface
                     let idx = read_u16(code, &mut frame.pc);
                     frame.pc += 2; // count + 0
-                    self.dispatch_interface(cp, idx, frame).map_err(|e| {
+                    self.dispatch_interface(cp, idx, caller_class_id, frame).map_err(|e| {
                         if e.starts_with("NullPointerException") { format!("{e} in {class_name}") } else { e }
                     })?;
                 }
@@ -1080,118 +1094,50 @@ impl Vm {
         Ok(())
     }
 
-    fn resolve_static_field(
-        &mut self,
-        cp: &[ConstantPoolEntry],
-        idx: u16,
-    ) -> Result<JValue, String> {
-        let (class_name, field_name, descriptor) = resolve_fieldref_ref(cp, idx);
-        // Run <clinit> if not yet done (initialises static fields via putstatic).
-        self.ensure_class_init(class_name)?;
-        // Search this class and its super-class chain for the static field (JVMS §5.4.3.2).
-        if let Some(v) = self.resolve_static_field_in_hierarchy(class_name, field_name) {
-            return Ok(v);
-        }
-        // Well-known JDK static fields that cannot be initialised via <clinit>
-        // because the JDK classes are not in the bundle.
-        match (class_name, field_name) {
-            ("java/lang/System", "out") => {
-                if let Some(v) = self.static_fields.get("java/lang/System").and_then(|m| m.get("out")) {
-                    return Ok(v.clone());
+    fn read_static_field_target(&mut self, target: &ResolvedFieldTarget) -> JValue {
+        // Transitional Phase 4 bridge: static storage is still name-keyed until
+        // Phase 5, but bytecode resolution now chooses the declaring ClassId.
+        if let Some(v) = self.static_fields
+            .get(&target.owner_class)
+            .and_then(|fields| fields.get(&target.name))
+            .cloned()
+        {
+            if target.owner_class == "java/lang/System" && target.name == "in" {
+                if let Some(r) = v.as_ref() {
+                    self.system_stdin = Some(r.clone());
                 }
+            }
+            return v;
+        }
+
+        match (target.owner_class.as_str(), target.name.as_str()) {
+            ("java/lang/System", "out") => {
                 let v = JValue::Ref(Some(JObject::new_print_stream(false)));
-                self.static_fields.entry(class_name.to_owned()).or_default().insert(field_name.to_owned(), v.clone());
-                Ok(v)
+                self.write_static_field_target(target, v.clone());
+                v
             }
             ("java/lang/System", "err") => {
-                if let Some(v) = self.static_fields.get("java/lang/System").and_then(|m| m.get("err")) {
-                    return Ok(v.clone());
-                }
                 let v = JValue::Ref(Some(JObject::new_print_stream(true)));
-                self.static_fields.entry(class_name.to_owned()).or_default().insert(field_name.to_owned(), v.clone());
-                Ok(v)
+                self.write_static_field_target(target, v.clone());
+                v
             }
             ("java/lang/System", "in") => {
-                if let Some(v) = self.static_fields.get("java/lang/System").and_then(|m| m.get("in")) {
-                    if let Some(r) = v.as_ref() {
-                        self.system_stdin = Some(r.clone());
-                    }
-                    return Ok(v.clone());
-                }
                 let stdin = JObject::new_process_pipe_input_stream();
                 let v = JValue::Ref(Some(stdin.clone()));
                 self.system_stdin = Some(stdin);
-                self.static_fields.entry(class_name.to_owned()).or_default().insert(field_name.to_owned(), v.clone());
-                Ok(v)
+                self.write_static_field_target(target, v.clone());
+                v
             }
-            _ => Ok(default_value_for_descriptor(descriptor)),
+            _ => default_value_for_descriptor(&target.descriptor),
         }
     }
 
-    /// Walk the class hierarchy to find a static field value.
-    fn resolve_static_field_in_hierarchy(&mut self, class_name: &str, field_name: &str) -> Option<JValue> {
-        // Check this class first.
-        if let Some(v) = self.static_fields.get(class_name).and_then(|m| m.get(field_name)) {
-            return Some(v.clone());
-        }
-        // Check super class and interfaces.
-        self.ensure_class_ready(class_name);
-        let (super_name, iface_names) = if let Some(class) = self.get_class(class_name) {
-            let sup = if class.super_class != 0 {
-                Some(class.constant_pool.class_name(class.super_class).to_owned())
-            } else {
-                None
-            };
-            let ifaces: Vec<String> = class.interfaces.iter()
-                .map(|&idx| class.constant_pool.class_name(idx).to_owned())
-                .collect();
-            (sup, ifaces)
-        } else {
-            (None, vec![])
-        };
-        if let Some(super_name) = super_name {
-            if let Some(v) = self.resolve_static_field_in_hierarchy(&super_name, field_name) {
-                return Some(v);
-            }
-        }
-        for iface_name in iface_names {
-            if let Some(v) = self.resolve_static_field_in_hierarchy(&iface_name, field_name) {
-                return Some(v);
-            }
-        }
-        None
-    }
-
-    /// Walk the class hierarchy to find which class owns a static field.
-    fn find_static_field_owner_class(&mut self, class_name: &str, field_name: &str) -> Option<String> {
-        if self.static_fields.get(class_name).and_then(|m| m.get(field_name)).is_some() {
-            return Some(class_name.to_owned());
-        }
-        self.ensure_class_ready(class_name);
-        let (super_name, iface_names) = if let Some(class) = self.get_class(class_name) {
-            let sup = if class.super_class != 0 {
-                Some(class.constant_pool.class_name(class.super_class).to_owned())
-            } else {
-                None
-            };
-            let ifaces: Vec<String> = class.interfaces.iter()
-                .map(|&idx| class.constant_pool.class_name(idx).to_owned())
-                .collect();
-            (sup, ifaces)
-        } else {
-            (None, vec![])
-        };
-        if let Some(s) = super_name {
-            if let Some(owner) = self.find_static_field_owner_class(&s, field_name) {
-                return Some(owner);
-            }
-        }
-        for iface in iface_names {
-            if let Some(owner) = self.find_static_field_owner_class(&iface, field_name) {
-                return Some(owner);
-            }
-        }
-        None
+    fn write_static_field_target(&mut self, target: &ResolvedFieldTarget, value: JValue) {
+        // Transitional Phase 4 bridge: replace with ClassId-keyed static state in Phase 5.
+        self.static_fields
+            .entry(target.owner_class.clone())
+            .or_default()
+            .insert(target.name.clone(), value);
     }
 
     fn resolve_instance_field(

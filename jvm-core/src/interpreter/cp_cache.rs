@@ -46,7 +46,10 @@ pub(crate) struct ResolvedMethodEntry {
 
 /// A resolved field entry for getstatic/putstatic fast path.
 pub(crate) struct ResolvedFieldEntry {
-    /// The class that owns the field (after hierarchy walk).
+    /// Loader-scoped class identity that owns the resolved field.
+    pub owner_class_id: ClassId,
+    /// Legacy class name that owns the field (after hierarchy walk).
+    /// Used only while static field storage remains name-keyed.
     pub owner_class: String,
     /// Field name.
     pub field_name: String,
