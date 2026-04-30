@@ -300,8 +300,9 @@ To resolve a symbolic reference from `D` to an interface method in interface `C`
    - first in `C`;
    - then as a public, non-static method of `Object`;
    - then among maximally-specific superinterface methods;
-   - then among other non-private, non-static superinterface methods permitted by
-     JVMS interface method resolution.
+   - then any non-private, non-static method declared in a superinterface of `C`,
+     with the implementation free to pick arbitrarily among multiple such
+     candidates (JVMS §5.4.3.4).
 4. If lookup fails, throw `NoSuchMethodError`.
 5. Apply access control from `D` to the resolved method.
 6. Impose loading constraints for class/interface names mentioned in the method
