@@ -100,7 +100,7 @@ the loader model and must not redefine class identity.
 Allowed values:
 
 - `(defining loader, binary name) -> class identity`;
-- `(initiating loader, name) -> class identity`;
+- `(initiating loader, binary name) -> class identity`;
 - `class identity -> binary name`;
 - `class identity -> defining loader`;
 - `class identity -> Class mirror`.
