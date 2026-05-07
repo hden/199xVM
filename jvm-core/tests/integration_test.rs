@@ -495,6 +495,17 @@ fn same_binary_name_under_distinct_loaders_has_distinct_class_mirrors() {
 }
 
 #[test]
+#[ignore = "Phase 0 regression target for loader-scoped Class reflection metadata"]
+fn defined_class_reflection_metadata_uses_class_identity() {
+    let result = run_jar_test(
+        "DefinedClassReflectionMetadataTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "public|fields=2|methods=2|ctors=1|annotations=0");
+}
+
+#[test]
 #[ignore = "Phase 0 regression target for loader-scoped static and clinit state"]
 fn same_binary_name_under_distinct_loaders_isolates_static_state() {
     let result = run_jar_test(
@@ -514,6 +525,28 @@ fn caller_loader_context_changes_symbolic_class_resolution() {
         "()Ljava/lang/String;",
     );
     assert_eq!(result, "left|right");
+}
+
+#[test]
+#[ignore = "Phase 0 regression target for caller-loader array initiating records"]
+fn anewarray_records_caller_as_array_initiating_loader() {
+    let result = run_jar_test(
+        "AnewArrayInitiatingLoaderTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "[Ljava.lang.String;|found");
+}
+
+#[test]
+#[ignore = "Phase 0 regression target for loader LinkageError propagation"]
+fn loader_linkage_error_survives_symbolic_resolution() {
+    let result = run_jar_test(
+        "LoaderLinkageErrorPropagationTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "LinkageError");
 }
 
 #[test]
