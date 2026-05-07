@@ -862,6 +862,7 @@ impl Vm {
                         .ok_or_else(|| format!("java/lang/NoClassDefFoundError: missing caller for {class_name}"))?;
                     let elem_class_id = self.resolve_symbolic_class(caller_class_id, cp, idx)?;
                     let array_class_id = self.resolve_array_class_for_component(
+                        caller_class_id,
                         elem_class_id,
                     )?;
                     let count_int = frame.stack.pop().unwrap().as_int();

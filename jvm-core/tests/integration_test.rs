@@ -546,7 +546,6 @@ fn caller_loader_context_changes_symbolic_class_resolution() {
 }
 
 #[test]
-#[ignore = "Phase 0 regression target for caller-loader array initiating records"]
 fn anewarray_records_caller_as_array_initiating_loader() {
     let result = run_jar_test(
         "AnewArrayInitiatingLoaderTest",
@@ -557,7 +556,6 @@ fn anewarray_records_caller_as_array_initiating_loader() {
 }
 
 #[test]
-#[ignore = "Phase 0 regression target for loader LinkageError propagation"]
 fn loader_linkage_error_survives_symbolic_resolution() {
     let result = run_jar_test(
         "LoaderLinkageErrorPropagationTest",
