@@ -1085,6 +1085,7 @@ impl Vm {
         let name = class_file.constant_pool.class_name(class_file.this_class).to_owned();
         let class_id = self.register_defined_class(defining_loader, name.clone());
         self.record_initiating_loader(defining_loader, name.clone(), class_id);
+        self.classes_by_id.insert(class_id, LazyClass::Ready(class_file.clone()));
         self.classes.insert(name, LazyClass::Ready(class_file));
     }
 
@@ -1715,6 +1716,15 @@ impl Vm {
         };
         let class_id = self.register_defined_class(defining_loader, descriptor.to_owned());
         self.record_initiating_loader(defining_loader, descriptor.to_owned(), class_id);
+
+        let initiating_loader = self
+            .class_record(caller_class_id)
+            .map(|record| record.defining_loader)
+            .unwrap_or(LoaderId::BOOTSTRAP);
+        if initiating_loader != defining_loader {
+            self.record_initiating_loader(initiating_loader, descriptor.to_owned(), class_id);
+        }
+
         Ok(class_id)
     }
 
