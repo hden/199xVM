@@ -979,8 +979,10 @@ impl super::Vm {
                 let target = self
                     .class_internal_name_from_obj(this)
                     .unwrap_or_else(|| "java/lang/Object".to_owned());
-                self.ensure_class_ready(&target);
-                let mods = self.get_class(&target).map(|cf| i32::from(cf.access_flags)).unwrap_or(0);
+                let mods = self
+                    .resolve_class_for_class_object(this, &target)
+                    .map(|cf| i32::from(cf.access_flags))
+                    .unwrap_or(0);
                 Some(JValue::Int(mods))
             }
             ("java/lang/Class", "isInstance") => {
@@ -1015,8 +1017,10 @@ impl super::Vm {
                 let target = self
                     .class_internal_name_from_obj(this)
                     .unwrap_or_else(|| "java/lang/Object".to_owned());
-                self.ensure_class_ready(&target);
-                let is_iface = self.get_class(&target).map(|cf| (cf.access_flags & 0x0200) != 0).unwrap_or(false);
+                let is_iface = self
+                    .resolve_class_for_class_object(this, &target)
+                    .map(|cf| (cf.access_flags & 0x0200) != 0)
+                    .unwrap_or(false);
                 Some(JValue::Int(if is_iface { 1 } else { 0 }))
             }
             ("java/lang/Class", "getComponentType") => {
@@ -1048,10 +1052,9 @@ impl super::Vm {
                 let target = self
                     .class_internal_name_from_obj(this)
                     .unwrap_or_else(|| "java/lang/Object".to_owned());
-                self.ensure_class_ready(&target);
                 let super_name = if target.starts_with('[') {
                     Some("java/lang/Object".to_owned())
-                } else if let Some(cf) = self.get_class(&target) {
+                } else if let Some(cf) = self.resolve_class_for_class_object(this, &target) {
                     if cf.super_class == 0 {
                         None
                     } else {
@@ -1068,10 +1071,9 @@ impl super::Vm {
                 let target = self
                     .class_internal_name_from_obj(this)
                     .unwrap_or_else(|| "java/lang/Object".to_owned());
-                self.ensure_class_ready(&target);
                 let iface_names: Vec<String> = if target.starts_with('[') {
                     vec!["java/lang/Cloneable".to_owned(), "java/io/Serializable".to_owned()]
-                } else if let Some(cf) = self.get_class(&target) {
+                } else if let Some(cf) = self.resolve_class_for_class_object(this, &target) {
                     cf.interfaces
                         .iter()
                         .map(|idx| cf.constant_pool.class_name(*idx).to_owned())
@@ -1113,8 +1115,10 @@ impl super::Vm {
                 let target = self
                     .class_internal_name_from_obj(this)
                     .unwrap_or_else(|| "java/lang/Object".to_owned());
-                self.ensure_class_ready(&target);
-                let is_record = self.get_class(&target).map(|cf| cf.attributes.iter().any(|a| matches!(a, Attribute::Record { .. }))).unwrap_or(false);
+                let is_record = self
+                    .resolve_class_for_class_object(this, &target)
+                    .map(|cf| cf.attributes.iter().any(|a| matches!(a, Attribute::Record { .. })))
+                    .unwrap_or(false);
                 Some(JValue::Int(if is_record { 1 } else { 0 }))
             }
             ("java/lang/Class", "getRecordComponents") => {
@@ -1122,8 +1126,7 @@ impl super::Vm {
                     .class_internal_name_from_obj(this)
                     .unwrap_or_else(|| "java/lang/Object".to_owned());
                 let mut comps_meta: Vec<(String, String)> = Vec::new();
-                self.ensure_class_ready(&target);
-                if let Some(cf) = self.get_class(&target) {
+                if let Some(cf) = self.resolve_class_for_class_object(this, &target) {
                     for attr in &cf.attributes {
                         if let Attribute::Record { components } = attr {
                             for c in components {
@@ -1150,8 +1153,7 @@ impl super::Vm {
                 let target = self
                     .class_internal_name_from_obj(this)
                     .unwrap_or_else(|| "java/lang/Object".to_owned());
-                self.ensure_class_ready(&target);
-                let anns = if let Some(cf) = self.get_class(&target) {
+                let anns = if let Some(cf) = self.resolve_class_for_class_object(this, &target) {
                     let attrs = cf.attributes.clone();
                     let cp = cf.constant_pool.clone();
                     self.parse_runtime_visible_annotations(&attrs, &cp)
@@ -1167,8 +1169,7 @@ impl super::Vm {
                 let public_only = _args.first().map(|v| v.as_int() != 0).unwrap_or(false);
                 let mut out = Vec::new();
                 let mut members: Vec<(String, String, u16)> = Vec::new();
-                self.ensure_class_ready(&target);
-                if let Some(cf) = self.get_class(&target) {
+                if let Some(cf) = self.resolve_class_for_class_object(this, &target) {
                     for f in &cf.fields {
                         if public_only && (f.access_flags & 0x0001) == 0 {
                             continue;
@@ -1195,19 +1196,10 @@ impl super::Vm {
                 let target = self
                     .class_internal_name_from_obj(this)
                     .unwrap_or_else(|| "java/lang/Object".to_owned());
-                let target_class_id = self.class_id_from_class_object(this);
                 let public_only = _args.first().map(|v| v.as_int() != 0).unwrap_or(false);
                 let mut out = Vec::new();
                 let mut members: Vec<(String, String, u16, Vec<String>)> = Vec::new();
-                if let Some(class_id) = target_class_id {
-                    self.ensure_class_ready_by_id(class_id);
-                } else {
-                    self.ensure_class_ready(&target);
-                }
-                let cf_opt = target_class_id
-                    .and_then(|class_id| self.get_class_by_id(class_id))
-                    .or_else(|| self.get_class(&target));
-                if let Some(cf) = cf_opt {
+                if let Some(cf) = self.resolve_class_for_class_object(this, &target) {
                     for m in &cf.methods {
                         if public_only && (m.access_flags & 0x0001) == 0 {
                             continue;
@@ -1252,8 +1244,7 @@ impl super::Vm {
                 let public_only = _args.first().map(|v| v.as_int() != 0).unwrap_or(false);
                 let mut out = Vec::new();
                 let mut members: Vec<(String, u16, Vec<String>)> = Vec::new();
-                self.ensure_class_ready(&target);
-                if let Some(cf) = self.get_class(&target) {
+                if let Some(cf) = self.resolve_class_for_class_object(this, &target) {
                     for m in &cf.methods {
                         if public_only && (m.access_flags & 0x0001) == 0 {
                             continue;

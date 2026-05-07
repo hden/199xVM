@@ -1315,6 +1315,17 @@ impl Vm {
         self.resolve_class(&name)
     }
 
+    pub(in crate::interpreter) fn resolve_class_for_class_object(
+        &mut self,
+        class_object: &JRef,
+        internal_name: &str,
+    ) -> Option<&ClassFile> {
+        if let Some(class_id) = self.class_id_from_class_object(class_object) {
+            return self.resolve_class_by_id(class_id);
+        }
+        self.resolve_class(internal_name)
+    }
+
     /// Flush buffered PrintStream output (`print` without trailing `println`).
     pub fn flush_printstreams(&mut self) {
         if self.stdout_mode == StdioMode::Inherit && !self.stdout_buffer.is_empty() {
@@ -1665,7 +1676,12 @@ impl Vm {
                         return Ok(class_id);
                     }
                 }
-                Ok(_) | Err(_) => {}
+                Ok(_) => {}
+                Err(err) => {
+                    if !err.contains("java/lang/ClassNotFoundException") {
+                        return Err(err);
+                    }
+                }
             }
             self.throw_no_class_def_found(internal_name);
             return Err(format!("java/lang/NoClassDefFoundError: {internal_name}"));
@@ -1738,6 +1754,7 @@ impl Vm {
 
     pub(in crate::interpreter) fn resolve_array_class_for_component(
         &mut self,
+        caller_class_id: ClassId,
         component_class_id: ClassId,
     ) -> Result<ClassId, String> {
         let component_record = self
@@ -1746,7 +1763,14 @@ impl Vm {
             .ok_or_else(|| "java/lang/NoClassDefFoundError: invalid array component".to_owned())?;
         let descriptor = Self::array_descriptor_for_component(&component_record.internal_name);
         let class_id = self.register_defined_class(component_record.defining_loader, descriptor.clone());
-        self.record_initiating_loader(component_record.defining_loader, descriptor, class_id);
+        self.record_initiating_loader(component_record.defining_loader, descriptor.clone(), class_id);
+        let initiating_loader = self
+            .class_record(caller_class_id)
+            .map(|record| record.defining_loader)
+            .unwrap_or(LoaderId::BOOTSTRAP);
+        if initiating_loader != component_record.defining_loader {
+            self.record_initiating_loader(initiating_loader, descriptor, class_id);
+        }
         Ok(class_id)
     }
 
