@@ -458,6 +458,123 @@ fn classloader_missing_class_throws_cnfe() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 0 loader identity regression targets
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "Phase 0 regression target for loader-scoped defineClass identity"]
+fn define_class_duplicate_same_loader_throws_linkage_error() {
+    let result = run_jar_test(
+        "DefineClassDuplicateSameLoaderTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "LinkageError");
+}
+
+#[test]
+#[ignore = "Phase 0 regression target for defineClass explicit-name validation"]
+fn define_class_explicit_name_mismatch_throws_no_class_def_found_error() {
+    let result = run_jar_test(
+        "DefineClassExplicitNameMismatchTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "NoClassDefFoundError");
+}
+
+#[test]
+#[ignore = "Phase 0 regression target for loader-scoped Class mirrors"]
+fn same_binary_name_under_distinct_loaders_has_distinct_class_mirrors() {
+    let result = run_jar_test(
+        "LoaderDistinctClassMirrorTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "distinct");
+}
+
+#[test]
+#[ignore = "Phase 0 regression target for loader-scoped Class reflection metadata"]
+fn defined_class_reflection_metadata_uses_class_identity() {
+    let result = run_jar_test(
+        "DefinedClassReflectionMetadataTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "public|fields=2|methods=2|ctors=1|annotations=0");
+}
+
+#[test]
+#[ignore = "Phase 0 regression target for loader-scoped static and clinit state"]
+fn same_binary_name_under_distinct_loaders_isolates_static_state() {
+    let result = run_jar_test(
+        "LoaderDistinctStaticStateTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "isolated");
+}
+
+#[test]
+#[ignore = "Phase 0 regression target for caller-loader class resolution"]
+fn caller_loader_context_changes_symbolic_class_resolution() {
+    let result = run_jar_test(
+        "CallerLoaderClassResolutionTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "left|right");
+}
+
+#[test]
+#[ignore = "Phase 0 regression target for caller-loader array initiating records"]
+fn anewarray_records_caller_as_array_initiating_loader() {
+    let result = run_jar_test(
+        "AnewArrayInitiatingLoaderTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "[Ljava.lang.String;|found");
+}
+
+#[test]
+#[ignore = "Phase 0 regression target for loader LinkageError propagation"]
+fn loader_linkage_error_survives_symbolic_resolution() {
+    let result = run_jar_test(
+        "LoaderLinkageErrorPropagationTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "LinkageError");
+}
+
+#[test]
+#[ignore = "Phase 0 regression target for cpCache owner isolation"]
+fn cp_cache_keeps_loader_distinct_member_owners_isolated() {
+    let result = run_jar_test(
+        "CpCacheOwnerIsolationTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "left-method|left-field|right-method|right-field");
+}
+
+#[test]
+#[ignore = "Phase 0 regression target for repeatable failed symbolic resolution"]
+fn failed_symbolic_resolutions_repeat_same_error_family() {
+    let result = run_jar_test(
+        "RepeatedResolutionFailureTest",
+        "run",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(
+        result,
+        "NoClassDefFoundError|NoSuchFieldError|NoSuchMethodError|NoSuchMethodError"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // JVMS §5.5: ExceptionInInitializerError when <clinit> throws
 // ---------------------------------------------------------------------------
 
