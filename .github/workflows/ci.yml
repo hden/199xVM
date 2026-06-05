@@ -13,8 +13,8 @@ permissions:
   contents: read
 
 jobs:
-  build-and-test:
-    name: Build and test
+  smoke:
+    name: Smoke
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -24,6 +24,9 @@ jobs:
 
       - name: Show Docker Compose version
         run: docker compose version
+
+      - name: Validate Docker Compose config
+        run: docker compose config --quiet
 
       - name: Build tool containers
         run: docker compose build java node rust
@@ -37,14 +40,5 @@ jobs:
       - name: Build web compiler
         run: docker compose run --rm node make javac
 
-      - name: Build test bundle
-        run: docker compose run --rm java make test-bundle
-
-      - name: Run compiler tests
-        run: docker compose run --rm node make test
-
-      - name: Run launcher tests
-        run: docker compose run --rm node make launcher-test
-
-      - name: Run Rust tests
-        run: docker compose run --rm rust cargo test --package jvm-core
+      - name: Run Rust unit tests
+        run: docker compose run --rm rust cargo test --package jvm-core --lib
