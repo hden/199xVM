@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - develop
+  push:
+    branches:
+      - develop
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Docker Compose version
+        run: docker compose version
+
+      - name: Build tool containers
+        run: docker compose build java node rust
+
+      - name: Build WebAssembly package
+        run: docker compose run --rm rust make wasm
+
+      - name: Build JDK shim
+        run: docker compose run --rm java make shim
+
+      - name: Build web compiler
+        run: docker compose run --rm node make javac
+
+      - name: Build test bundle
+        run: docker compose run --rm java make test-bundle
+
+      - name: Run compiler tests
+        run: docker compose run --rm node make test
+
+      - name: Run launcher tests
+        run: docker compose run --rm node make launcher-test
+
+      - name: Run Rust tests
+        run: docker compose run --rm rust cargo test --package jvm-core
