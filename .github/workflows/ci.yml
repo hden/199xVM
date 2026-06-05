@@ -50,3 +50,10 @@ jobs:
 
       - name: Run Rust unit tests
         run: docker compose run --rm rust cargo test --package jvm-core --lib
+
+      - name: Make Rust cache readable
+        if: always()
+        run: |
+          if [ -d target ]; then
+            sudo chown -R "$(id -u):$(id -g)" target
+          fi
