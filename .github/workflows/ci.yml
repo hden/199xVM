@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Show Docker Compose version
         run: docker compose version
@@ -29,7 +29,7 @@ jobs:
         run: docker compose config --quiet
 
       - name: Cache Rust build outputs
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target
           key: ${{ runner.os }}-rust-target-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'jvm-core/Cargo.toml') }}
