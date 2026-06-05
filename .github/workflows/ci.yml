@@ -28,6 +28,14 @@ jobs:
       - name: Validate Docker Compose config
         run: docker compose config --quiet
 
+      - name: Cache Rust build outputs
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-rust-target-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'jvm-core/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-target-
+
       - name: Build tool containers
         run: docker compose build java node rust
 
