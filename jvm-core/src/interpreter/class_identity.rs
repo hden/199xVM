@@ -141,7 +141,25 @@ impl ClassIdentityRegistry {
 }
 
 fn binary_name_from_internal_name(internal_name: &str) -> String {
-    internal_name.replace('/', ".")
+    if !internal_name.starts_with('[') {
+        return internal_name.replace('/', ".");
+    }
+
+    let mut out = String::with_capacity(internal_name.len());
+    let mut chars = internal_name.chars().peekable();
+    while let Some(ch) = chars.next() {
+        out.push(ch);
+        if ch == 'L' {
+            for component_ch in chars.by_ref() {
+                if component_ch == ';' {
+                    out.push(';');
+                    break;
+                }
+                out.push(if component_ch == '/' { '.' } else { component_ch });
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -209,5 +227,20 @@ mod tests {
             duplicate,
             Err(super::DefineClassError::Duplicate(existing)) if existing == first
         ));
+    }
+
+    #[test]
+    fn array_class_records_use_java_visible_names() {
+        let mut registry = ClassIdentityRegistry::new();
+
+        let class_id =
+            registry.register_defined_class(LoaderId::BOOTSTRAP, "[[Lpkg/Thing;");
+
+        assert_eq!(
+            registry
+                .class_record(class_id)
+                .map(|record| record.binary_name.as_str()),
+            Some("[[Lpkg.Thing;"),
+        );
     }
 }

@@ -71,9 +71,11 @@ public abstract class ClassLoader {
             try {
                 if (parent != null) {
                     c = parent.loadClass(name, false);
+                } else {
+                    c = Class.forName(name, false, null);
                 }
             } catch (ClassNotFoundException e) {
-                // parent didn't find it
+                // parent/bootstrap lookup didn't find it
             }
             if (c == null) {
                 c = findClass(name);

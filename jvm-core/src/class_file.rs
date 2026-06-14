@@ -74,7 +74,7 @@ fn decode_modified_utf8(bytes: &[u8]) -> Result<String, String> {
 }
 
 /// A parsed Java class file.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ClassFile {
     pub minor_version: u16,
     pub major_version: u16,
@@ -183,7 +183,7 @@ pub enum ConstantPoolEntry {
 }
 
 /// Field metadata.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FieldInfo {
     pub access_flags: u16,
     pub name_index: u16,
@@ -192,7 +192,7 @@ pub struct FieldInfo {
 }
 
 /// Method metadata including bytecode.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MethodInfo {
     pub access_flags: u16,
     pub name_index: u16,

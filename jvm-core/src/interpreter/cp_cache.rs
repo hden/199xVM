@@ -3,11 +3,15 @@ use std::rc::Rc;
 
 use crate::class_file::{BootstrapMethod, ConstantPoolEntry, ExceptionTableEntry};
 
+use super::class_identity::ClassId;
+
 /// A resolved static/special method entry ready for frame construction.
 /// All resolution work (owner lookup, code extraction, descriptor parsing)
 /// is done once and stored here for subsequent invocations.
 pub(crate) struct ResolvedMethodEntry {
-    /// Owner class name (the class that actually defines the method).
+    /// Loader-scoped owner class identity when known.
+    pub owner_class_id: Option<ClassId>,
+    /// Legacy owner class name used when loader-scoped identity is not available.
     pub owner_class: String,
     /// Pre-extracted code bytes.
     pub code: Rc<Vec<u8>>,

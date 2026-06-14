@@ -4,6 +4,7 @@ use crate::class_file::{BootstrapMethod, ConstantPoolEntry, ExceptionTableEntry}
 use crate::heap::{JObject, JRef, JValue};
 
 use super::cp_cache::CpCache;
+use super::class_identity::{ClassId, LoaderId};
 use super::descriptors::*;
 use super::frame::*;
 use super::Vm;
@@ -14,6 +15,7 @@ use super::Vm;
 
 /// All data needed to execute or resume a method frame.
 pub(crate) struct FrameInfo {
+    pub class_id: Option<ClassId>,
     pub frame: Frame,
     pub code: Vec<u8>,
     pub cp: Rc<Vec<ConstantPoolEntry>>,
@@ -87,7 +89,7 @@ impl Vm {
 
             let result = self.execute_opcode(
                 &mut fi.frame, &fi.code, &fi.cp, &fi.cache, &fi.frame_owner,
-                &fi.bootstrap_methods, &fi.exception_table, opcode,
+                fi.class_id, &fi.bootstrap_methods, &fi.exception_table, opcode,
             );
 
             match result {
@@ -169,7 +171,7 @@ impl Vm {
 
             let result = self.execute_opcode(
                 &mut fi.frame, &fi.code, &fi.cp, &fi.cache, &fi.frame_owner,
-                &fi.bootstrap_methods, &fi.exception_table, opcode,
+                fi.class_id, &fi.bootstrap_methods, &fi.exception_table, opcode,
             );
 
             match result {
@@ -596,6 +598,7 @@ impl Vm {
             None
         };
         Ok(Some(FrameInfo {
+            class_id: info.class_id,
             frame: Frame { locals, stack: Vec::new(), pc: 0 },
             code: info.code, cp: info.cp, cache: info.cache, frame_owner: fo,
             bootstrap_methods: info.bootstrap_methods, exception_table: info.exception_table,
@@ -626,6 +629,23 @@ impl Vm {
         }
 
         let runtime_class = this.borrow().class_name.clone();
+        let receiver_class_id = if is_bytecode_lambda {
+            None
+        } else {
+            self.custom_loader_class_id_for_object(&this)
+        };
+        if let Some(class_id) = receiver_class_id {
+            if let Some(frame) = self.try_custom_loader_instance_frame(
+                class_id,
+                Rc::clone(&this),
+                method_name,
+                descriptor,
+                &args,
+                push_return,
+            )? {
+                return Ok(Some(frame));
+            }
+        }
         // For bytecode lambdas, resolve on the interface class (class_name) so that
         // default methods are found.  For normal objects, use the runtime class.
         let resolve_class = if is_bytecode_lambda {
@@ -679,6 +699,7 @@ impl Vm {
         let fo = format!("{}.{method_name}{}", info.class_name, info.descriptor);
         let synchronized_monitor = self.acquire_instance_synchronized_monitor(info.access_flags, &locals);
         Ok(Some(FrameInfo {
+            class_id: info.class_id,
             frame: Frame { locals, stack: Vec::new(), pc: 0 },
             code: info.code, cp: info.cp, cache: info.cache, frame_owner: fo,
             bootstrap_methods: info.bootstrap_methods, exception_table: info.exception_table,
@@ -697,6 +718,19 @@ impl Vm {
         args: Vec<JValue>,
         push_return: bool,
     ) -> Result<Option<FrameInfo>, String> {
+        if let Some(class_id) = self.custom_loader_class_id_for_object(&this) {
+            if let Some(frame) = self.try_custom_loader_instance_frame(
+                class_id,
+                Rc::clone(&this),
+                method_name,
+                descriptor,
+                &args,
+                push_return,
+            )? {
+                return Ok(Some(frame));
+            }
+        }
+
         let resolved = if self.method_exists(class_name, method_name, descriptor) {
             descriptor.to_owned()
         } else {
@@ -735,6 +769,7 @@ impl Vm {
         let fo = format!("{}.{method_name}{}", info.class_name, info.descriptor);
         let synchronized_monitor = self.acquire_instance_synchronized_monitor(info.access_flags, &locals);
         Ok(Some(FrameInfo {
+            class_id: info.class_id,
             frame: Frame { locals, stack: Vec::new(), pc: 0 },
             code: info.code, cp: info.cp, cache: info.cache, frame_owner: fo,
             bootstrap_methods: info.bootstrap_methods, exception_table: info.exception_table,
@@ -753,6 +788,91 @@ impl Vm {
             }
         }
         None
+    }
+
+    fn build_instance_frame_from_exec_info(
+        &mut self,
+        this: JRef,
+        info: &super::MethodExecInfo,
+        method_name: &str,
+        call_descriptor: &str,
+        args: Vec<JValue>,
+        push_return: bool,
+    ) -> FrameInfo {
+        let (param_tokens, _) = Self::parse_method_descriptor_tokens(call_descriptor);
+        let req = 1 + param_tokens.iter().map(|t| if t == "J" || t == "D" { 2 } else { 1 }).sum::<usize>();
+        let total = info.max_locals.max(req);
+        let mut locals = vec![JValue::Void; total];
+        locals[0] = JValue::Ref(Some(this));
+        let mut li = 1usize;
+        for (a, t) in args.into_iter().zip(param_tokens.iter()) {
+            if li >= locals.len() { break; }
+            locals[li] = self.adapt_value_for_descriptor(t, a);
+            li += if t == "J" || t == "D" { 2 } else { 1 };
+        }
+
+        let fo = format!("{}.{method_name}{}", info.class_name, info.descriptor);
+        let synchronized_monitor = self.acquire_instance_synchronized_monitor(info.access_flags, &locals);
+        FrameInfo {
+            class_id: info.class_id,
+            frame: Frame { locals, stack: Vec::new(), pc: 0 },
+            code: info.code.clone(),
+            cp: Rc::clone(&info.cp),
+            cache: Rc::clone(&info.cache),
+            frame_owner: fo,
+            bootstrap_methods: info.bootstrap_methods.clone(),
+            exception_table: info.exception_table.clone(),
+            push_return,
+            concat_state: None,
+            lambda_return_adapt: None,
+            synchronized_monitor,
+        }
+    }
+
+    fn try_custom_loader_instance_frame(
+        &mut self,
+        class_id: ClassId,
+        this: JRef,
+        method_name: &str,
+        call_descriptor: &str,
+        args: &[JValue],
+        push_return: bool,
+    ) -> Result<Option<FrameInfo>, String> {
+        let Some(info) = self.resolve_method_exec_info_for_class_id(
+            class_id,
+            method_name,
+            call_descriptor,
+        ) else {
+            return Ok(None);
+        };
+        if info.access_flags & 0x0400 != 0 {
+            let ms = format!("{}.{method_name}{}", info.class_name, info.descriptor);
+            let exc = self.new_vm_exception_message("java/lang/AbstractMethodError", ms.clone());
+            *self.pending_exception_mut() = Some(exc);
+            return Err(format!("java/lang/AbstractMethodError: {ms}"));
+        }
+        if !info.has_code {
+            return Ok(None);
+        }
+        Ok(Some(self.build_instance_frame_from_exec_info(
+            this,
+            &info,
+            method_name,
+            call_descriptor,
+            args.to_vec(),
+            push_return,
+        )))
+    }
+
+    fn custom_loader_class_id_for_object(&self, obj: &JRef) -> Option<ClassId> {
+        self.class_id_for_object(obj).filter(|class_id| {
+            self.class_record(*class_id)
+                .map(|record| {
+                    record.defining_loader != LoaderId::BOOTSTRAP
+                        && record.defining_loader != LoaderId::SYSTEM
+                })
+                .unwrap_or(false)
+        })
     }
 }
 
