@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - develop
+  push:
+    branches:
+      - develop
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Show Docker Compose version
+        run: docker compose version
+
+      - name: Validate Docker Compose config
+        run: docker compose config --quiet
+
+      - name: Cache Rust build outputs
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-rust-target-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'jvm-core/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-target-
+
+      - name: Build tool containers
+        run: docker compose build java node rust
+
+      - name: Build WebAssembly package
+        run: docker compose run --rm rust make wasm
+
+      - name: Build JDK shim
+        run: docker compose run --rm java make shim
+
+      - name: Build web compiler
+        run: docker compose run --rm node make javac
+
+      - name: Run Rust unit tests
+        run: docker compose run --rm rust cargo test --package jvm-core --lib
+
+      - name: Make Rust cache readable
+        if: always()
+        run: |
+          if [ -d target ]; then
+            sudo chown -R "$(id -u):$(id -g)" target
+          fi
