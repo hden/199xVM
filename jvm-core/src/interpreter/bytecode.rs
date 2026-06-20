@@ -3,7 +3,7 @@ use crate::class_file::{BootstrapMethod, ConstantPoolEntry, ExceptionTableEntry}
 use crate::heap::{JObject, JValue, NativePayload};
 
 use super::class_identity::ClassId;
-use super::{ResolvedFieldTarget, Vm};
+use super::{ResolvedFieldTarget, Vm, ACC_STATIC};
 use super::cp_cache::{CpCache, CpCacheEntry, ResolvedFieldEntry};
 use super::descriptors::*;
 use super::frame::*;
@@ -680,106 +680,72 @@ impl Vm {
                 // ---- Field access ----
                 0xb2 => { // getstatic
                     let idx = read_u16(code, &mut frame.pc);
-                    // Fast path: check cpCache for resolved field.
-                    let cached_val = {
-                        let cb = cache.borrow();
-                        if let Some(Some(CpCacheEntry::Field(e))) = cb.get(idx as usize) {
-                            let owner = self.class_record(e.owner_class_id)
-                                .map(|record| record.internal_name.as_str())
-                                .unwrap_or(e.owner_class.as_str());
-                            let v = self.static_fields.get(owner)
-                                .and_then(|m| m.get(&e.field_name))
-                                .cloned()
-                                .unwrap_or_else(|| default_value_for_descriptor(&e.field_descriptor));
-                            Some(v)
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some(v) = cached_val {
-                        frame.stack.push(v);
-                    } else {
-                        let caller_class_id = caller_class_id
-                            .ok_or_else(|| "java/lang/NoClassDefFoundError: missing caller for getstatic".to_owned())?;
-                        let target = self.resolve_field_reference(caller_class_id, cp, idx)?;
-                        if target.access_flags & 0x0008 == 0 {
-                            let detail = format!("getstatic {}.{}:{}", target.owner_class, target.name, target.descriptor);
-                            self.throw_incompatible_class_change_error(&detail);
-                            return Err(format!("java/lang/IncompatibleClassChangeError: {detail}"));
-                        }
-                        self.ensure_class_init(&target.owner_class)?;
-                        let v = self.read_static_field_target(&target);
-                        frame.stack.push(v);
-                        cache.borrow_mut()[idx as usize] = Some(CpCacheEntry::Field(
-                            ResolvedFieldEntry {
-                                owner_class_id: target.owner_class_id,
-                                owner_class: target.owner_class,
-                                field_name: target.name,
-                                field_descriptor: target.descriptor,
-                            }
-                        ));
-                    }
+                    let target = self.resolve_cached_field_target(
+                        caller_class_id,
+                        cp,
+                        cache,
+                        idx,
+                        "getstatic",
+                    )?;
+                    self.require_field_staticness(&target, true, "getstatic")?;
+                    self.ensure_class_init(&target.owner_class)?;
+                    let v = self.read_static_field_target(&target);
+                    frame.stack.push(v);
                 }
                 0xb3 => { // putstatic
                     let idx = read_u16(code, &mut frame.pc);
                     let val = frame.stack.pop().unwrap_or(JValue::Void);
-                    // Fast path: check cpCache.
-                    let cached = {
-                        let cb = cache.borrow();
-                        match cb.get(idx as usize) {
-                            Some(Some(CpCacheEntry::Field(e))) => Some((
-                                e.owner_class.clone(), e.field_name.clone(),
-                            )),
-                            _ => None,
-                        }
-                    };
-                    if let Some((owner, field)) = cached {
-                        self.static_fields.entry(owner).or_default().insert(field, val);
-                    } else {
-                        let caller_class_id = caller_class_id
-                            .ok_or_else(|| "java/lang/NoClassDefFoundError: missing caller for putstatic".to_owned())?;
-                        let target = self.resolve_field_reference(caller_class_id, cp, idx)?;
-                        if target.access_flags & 0x0008 == 0 {
-                            let detail = format!("putstatic {}.{}:{}", target.owner_class, target.name, target.descriptor);
-                            self.throw_incompatible_class_change_error(&detail);
-                            return Err(format!("java/lang/IncompatibleClassChangeError: {detail}"));
-                        }
-                        self.ensure_class_init(&target.owner_class)?;
-                        self.write_static_field_target(&target, val);
-                        cache.borrow_mut()[idx as usize] = Some(CpCacheEntry::Field(
-                            ResolvedFieldEntry {
-                                owner_class_id: target.owner_class_id,
-                                owner_class: target.owner_class,
-                                field_name: target.name,
-                                field_descriptor: target.descriptor,
-                            }
-                        ));
-                    }
+                    let target = self.resolve_cached_field_target(
+                        caller_class_id,
+                        cp,
+                        cache,
+                        idx,
+                        "putstatic",
+                    )?;
+                    self.require_field_staticness(&target, true, "putstatic")?;
+                    self.ensure_class_init(&target.owner_class)?;
+                    self.write_static_field_target(&target, val);
                 }
                 0xb4 => { // getfield
                     let idx = read_u16(code, &mut frame.pc);
-                    let (_, gf_field_name, _) = resolve_fieldref_ref(cp, idx);
+                    let target = self.resolve_cached_field_target(
+                        caller_class_id,
+                        cp,
+                        cache,
+                        idx,
+                        "getfield",
+                    )?;
+                    self.require_field_staticness(&target, false, "getfield")?;
                     let obj_ref = frame.stack.pop()
-                        .ok_or_else(|| format!("getfield {gf_field_name}: empty stack in {class_name}"))?;
+                        .ok_or_else(|| format!("getfield {}: empty stack in {class_name}", target.name))?;
                     if matches!(obj_ref, JValue::Void) {
                         return Err(format!(
-                            "getfield {gf_field_name}: expected Ref on stack, got Void in {class_name}"
+                            "getfield {}: expected Ref on stack, got Void in {class_name}",
+                            target.name
                         ));
                     }
-                    let v = self.resolve_instance_field(cp, idx, &obj_ref)?;
+                    let v = self.read_instance_field_target(&target, &obj_ref)?;
                     frame.stack.push(v);
                 }
                 0xb5 => { // putfield
                     let idx = read_u16(code, &mut frame.pc);
+                    let target = self.resolve_cached_field_target(
+                        caller_class_id,
+                        cp,
+                        cache,
+                        idx,
+                        "putfield",
+                    )?;
+                    self.require_field_staticness(&target, false, "putfield")?;
                     let val = frame.stack.pop().unwrap_or(JValue::Void);
                     let obj_ref = frame.stack.pop().unwrap_or(JValue::Void);
                     if matches!(obj_ref, JValue::Void) {
-                        let (_, pf_field_name, _) = resolve_fieldref_ref(cp, idx);
                         return Err(format!(
-                            "putfield {pf_field_name}: expected Ref on stack, got Void in {class_name}"
+                            "putfield {}: expected Ref on stack, got Void in {class_name}",
+                            target.name
                         ));
                     }
-                    self.set_instance_field(cp, idx, &obj_ref, val)?;
+                    self.write_instance_field_target(&target, &obj_ref, val)?;
                 }
 
                 // ---- Method invocation ----
@@ -1140,33 +1106,80 @@ impl Vm {
             .insert(target.name.clone(), value);
     }
 
-    fn resolve_instance_field(
+    fn resolve_cached_field_target(
         &mut self,
+        caller_class_id: Option<ClassId>,
         cp: &[ConstantPoolEntry],
+        cache: &CpCache,
         idx: u16,
+        opcode: &str,
+    ) -> Result<ResolvedFieldTarget, String> {
+        if let Some(Some(CpCacheEntry::Field(entry))) = cache.borrow().get(idx as usize) {
+            return Ok(ResolvedFieldTarget {
+                owner_class_id: entry.owner_class_id,
+                owner_class: entry.owner_class.clone(),
+                name: entry.field_name.clone(),
+                descriptor: entry.field_descriptor.clone(),
+                access_flags: entry.access_flags,
+            });
+        }
+
+        let caller_class_id = caller_class_id
+            .ok_or_else(|| format!("java/lang/NoClassDefFoundError: missing caller for {opcode}"))?;
+        let target = self.resolve_field_reference(caller_class_id, cp, idx)?;
+        cache.borrow_mut()[idx as usize] = Some(CpCacheEntry::Field(ResolvedFieldEntry {
+            owner_class_id: target.owner_class_id,
+            owner_class: target.owner_class.clone(),
+            field_name: target.name.clone(),
+            field_descriptor: target.descriptor.clone(),
+            access_flags: target.access_flags,
+        }));
+        Ok(target)
+    }
+
+    fn require_field_staticness(
+        &mut self,
+        target: &ResolvedFieldTarget,
+        expected_static: bool,
+        opcode: &str,
+    ) -> Result<(), String> {
+        if (target.access_flags & ACC_STATIC != 0) == expected_static {
+            return Ok(());
+        }
+        let detail = format!(
+            "{opcode} {}.{}:{}",
+            target.owner_class, target.name, target.descriptor
+        );
+        self.throw_incompatible_class_change_error(&detail);
+        Err(format!("java/lang/IncompatibleClassChangeError: {detail}"))
+    }
+
+    fn read_instance_field_target(
+        &mut self,
+        target: &ResolvedFieldTarget,
         obj_ref: &JValue,
     ) -> Result<JValue, String> {
-        let (_, field_name, field_desc) = resolve_fieldref_ref(cp, idx);
         match obj_ref.as_ref() {
             Some(r) => {
-                let default = default_value_for_descriptor(field_desc);
-                Ok(r.borrow().fields.get(field_name).cloned().unwrap_or(default))
+                let default = default_value_for_descriptor(&target.descriptor);
+                Ok(r.borrow().fields.get(&target.name).cloned().unwrap_or(default))
             }
-            None => Err(format!("NullPointerException: getfield {field_name}")),
+            None => Err(format!("NullPointerException: getfield {}", target.name)),
         }
     }
 
-    fn set_instance_field(
+    fn write_instance_field_target(
         &mut self,
-        cp: &[ConstantPoolEntry],
-        idx: u16,
+        target: &ResolvedFieldTarget,
         obj_ref: &JValue,
         val: JValue,
     ) -> Result<(), String> {
-        let (_, field_name, _) = resolve_fieldref_ref(cp, idx);
         match obj_ref.as_ref() {
-            Some(r) => { r.borrow_mut().fields.insert(field_name.to_owned(), val); Ok(()) }
-            None => Err(format!("NullPointerException: putfield {field_name}")),
+            Some(r) => {
+                r.borrow_mut().fields.insert(target.name.clone(), val);
+                Ok(())
+            }
+            None => Err(format!("NullPointerException: putfield {}", target.name)),
         }
     }
 

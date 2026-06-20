@@ -637,6 +637,39 @@ fn member_reference_kind_mismatch_throws_icce() {
 }
 
 #[test]
+fn field_access_kind_mismatch_throws_icce() {
+    let result = run_jar_test(
+        "MemberReferenceKindMismatchTest",
+        "fieldAccessKindMismatch",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(
+        result,
+        "IncompatibleClassChangeError|IncompatibleClassChangeError|IncompatibleClassChangeError|IncompatibleClassChangeError"
+    );
+}
+
+#[test]
+fn instance_field_resolution_uses_caller_loader() {
+    let result = run_jar_test(
+        "MemberReferenceKindMismatchTest",
+        "instanceFieldResolutionUsesCallerLoader",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "none|IncompatibleClassChangeError");
+}
+
+#[test]
+fn missing_instance_field_throws_no_such_field_error() {
+    let result = run_jar_test(
+        "MemberReferenceKindMismatchTest",
+        "missingInstanceField",
+        "()Ljava/lang/String;",
+    );
+    assert_eq!(result, "NoSuchFieldError");
+}
+
+#[test]
 fn anewarray_preserves_array_component_descriptor() {
     let result = run_jar_test(
         "AnewArrayComponentDescriptorTest",
